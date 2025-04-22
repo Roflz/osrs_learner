@@ -9,29 +9,41 @@ from pynput import mouse, keyboard
 from ultralytics import YOLO
 from utils import get_timestamp, ensure_dir
 
+import pygetwindow as gw  # ← new import
+
 class OSRSCapture:
-    def __init__(self, save_dir="data", screen_region=None, interval=0.2):
-        self.save_dir = save_dir
-        self.screen_region = screen_region or {"top": 100, "left": 100, "width": 800, "height": 600}
+    def __init__(self,
+                 save_dir="data",
+                 window_title="Old School RuneScape",
+                 screen_region=None,
+                 interval=0.2):
+
+        # Try to locate the OSRS client window by its title
+        wins = gw.getWindowsWithTitle(window_title)
+        if wins:
+            w = wins[0]
+            region = {
+                "top":    w.top,
+                "left":   w.left,
+                "width":  w.width,
+                "height": w.height
+            }
+        else:
+            # Fallback to the provided region or a default
+            region = screen_region or {"top": 100, "left": 100, "width": 800, "height": 600}
+
+        self.screen_region = region
         self.interval = interval
         self.running = False
         self.click_queue = []
         self.key_queue = []
         self.action_callback = None
 
+        # … rest of your init as before …
         self.img_dir = os.path.join(save_dir, "screenshots")
         self.csv_path = os.path.join(save_dir, "actions.csv")
         ensure_dir(self.img_dir)
-
-        self.csv_file = open(self.csv_path, "a", newline="")
-        self.csv_writer = csv.writer(self.csv_file)
-        if os.stat(self.csv_path).st_size == 0:
-            self.csv_writer.writerow(["timestamp", "img_path", "mouse_x", "mouse_y", "key_or_button", "action_type"])
-
-        self.mouse_listener = mouse.Listener(on_click=self.on_click)
-        self.keyboard_listener = keyboard.Listener(on_press=self.on_press, on_release=self.on_release)
-        self.yolo_model = YOLO("yolo/osrs_custom.pt")  # path to your YOLOv8 model
-        self.sct = mss()
+        # etc.
 
     def on_click(self, x, y, button, pressed):
         if pressed:
