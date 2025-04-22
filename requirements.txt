@@ -1,0 +1,11 @@
+pandas
+matplotlib
+scikit-learn
+joblib
+pillow
+opencv-python
+mss
+pynput
+ultralytics
+pytesseract
+notebook
