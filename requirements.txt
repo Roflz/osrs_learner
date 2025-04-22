@@ -10,3 +10,4 @@ ultralytics
 pytesseract
 notebook
 jupyterlab
+pygetwindow

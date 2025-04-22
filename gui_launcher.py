@@ -1,224 +1,191 @@
 import threading
+import time
 import tkinter as tk
+from tkinter import messagebox
+import joblib
+import pandas as pd
 from PIL import Image, ImageTk
 import cv2
 import numpy as np
+from pynput import mouse, keyboard
+
 from capture_core import OSRSCapture
 import os
-import pygetwindow as gw  # new import for window detection
-from datetime import datetime
-import json
-from tkinter import messagebox  # for warning dialogs
 import pyautogui
+from mss import mss as mss_module
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from datetime import datetime
+import pytesseract
+import re
 
 class RecorderApp:
     def __init__(self, root):
         self.root = root
         self.root.title("OSRS Learner Recorder")
-        self.root.geometry("600x600")
+        self.root.geometry("800x600")
+
+        # Root layout: Graph expands, controls stay minimal
+        self.root.rowconfigure(0, weight=1)
+        self.root.rowconfigure(1, weight=0)
+        self.root.columnconfigure(0, weight=1)
+
+        # Initialize capture core
         self.capture = OSRSCapture()
         self.capture.action_callback = self.track_action
         self.capture_thread = None
 
-        # Recording controls
-        self.status_var = tk.StringVar(value="Status: Idle")
-        self.toggle_button = tk.Button(root, text="Start Recording", command=self.toggle_recording, height=2, width=20)
-        self.status_label = tk.Label(root, textvariable=self.status_var)
-        self.toggle_button.pack(pady=5)
-        self.status_label.pack()
+        # Input counters
+        self.click_count = 0
+        self.key_count = 0
 
-        # Preview and stats
-        self.preview_canvas = tk.Label(root)
-        self.preview_canvas.pack(pady=5)
-        self.stats_label = tk.Label(root, text="Frames: 0 | Actions: 0 | XP popups: 0")
-        self.stats_label.pack(pady=5)
+        # --- Graph Area ---
+        graph_frame = tk.Frame(root)
+        graph_frame.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
+        graph_frame.rowconfigure(0, weight=1)
+        graph_frame.columnconfigure(0, weight=1)
 
-        # Recent XP log
-        self.xp_log_label = tk.Label(root, text="Recent XP Events:")
-        self.xp_log_label.pack()
-        self.xp_log_box = tk.Listbox(root, height=5, width=50)
-        self.xp_log_box.pack(pady=5)
+        self.fig, self.ax = plt.subplots()
+        self.canvas = FigureCanvasTkAgg(self.fig, master=graph_frame)
+        self.canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
 
-        # XP graph and tooltip
-        self.fig, self.ax = plt.subplots(figsize=(5, 2.5))
-        self.tooltip = tk.StringVar(value="")
-        self.canvas = FigureCanvasTkAgg(self.fig, master=root)
-        self.canvas.get_tk_widget().pack(pady=5)
-        self.tooltip_label = tk.Label(root, textvariable=self.tooltip, fg="gray")
-        self.tooltip_label.pack()
+        self.tooltip = tk.StringVar()
+        tk.Label(graph_frame, textvariable=self.tooltip, fg="gray").grid(row=1, column=0, sticky="w", pady=(4,0))
 
-        # XP summary panel
-        self.xp_summary_label = tk.Label(root, text="Total XP by Skill:", font=("Arial", 10, "bold"))
-        self.xp_summary_label.pack()
-        self.xp_summary_box = tk.Listbox(root, height=5, width=40)
-        self.xp_summary_box.pack(pady=5)
-        self.reset_summary_button = tk.Button(root, text="Reset Summary", command=self.reset_summary)
-        self.reset_summary_button.pack(pady=5)
+        # --- Bottom Panel ---
+        bottom = tk.Frame(root)
+        bottom.grid(row=1, column=0, sticky="ew", padx=5, pady=5)
+
+        ctrl = tk.Frame(bottom)
+        ctrl.pack(fill="x", pady=2)
+        self.toggle_button = tk.Button(ctrl, text="Start Recording", command=self.toggle_recording)
+        self.toggle_button.pack(side="left", padx=3)
+        tk.Button(ctrl, text="Select XP Popup Region", command=self.capture.select_popup_region).pack(side="left", padx=3)
+        self.show_popup_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(ctrl, text="Show XP Region", variable=self.show_popup_var).pack(side="left", padx=3)
+        self.status_label = tk.Label(ctrl, text="Status: Idle")
+        self.status_label.pack(side="left", padx=3)
+
+        self.stats_label = tk.Label(bottom, text="Actions: 0 | XP: 0 | Clicks: 0 | Keys: 0")
+        self.stats_label.pack(fill="x", pady=2)
+
+        logsum = tk.Frame(bottom)
+        logsum.pack(fill="x", pady=2)
+
+        left = tk.Frame(logsum)
+        left.pack(side="left", fill="both", expand=True, padx=5)
+        tk.Label(left, text="Recent XP Events:").pack(anchor="w")
+        self.xp_log_box = tk.Listbox(left, height=4)
+        self.xp_log_box.pack(fill="both", expand=True)
+
+        right = tk.Frame(logsum)
+        right.pack(side="left", fill="both", expand=True, padx=5)
+        tk.Label(right, text="XP Summary:").pack(anchor="w")
+        self.xp_summary_box = tk.Listbox(right, height=4)
+        self.xp_summary_box.pack(fill="both", expand=True)
+        tk.Button(right, text="Reset Summary", command=self.reset_summary).pack(pady=2)
+
+        goal_frame = tk.Frame(bottom)
+        goal_frame.pack(fill="x", pady=5)
+        self.goal_ui = GoalSettingUI(goal_frame, recommender=None, autoplayer=None)
 
         # Internal state
-        self.preview_running = False
-        self.total_frames = 0
         self.total_actions = 0
         self.xp_popup_count = 0
-        self.action_counts = {}
-        self.xp_history = []  # (skill, xp_value, timestamp)
+        self.xp_history = []
 
-        # Data paths
-        self.goal_path = os.path.join("data", "goal.json")
-        self.xp_log_path = os.path.join("data", "xp_events.csv")
         os.makedirs("data", exist_ok=True)
+        self.xp_log_path = os.path.join("data", "xp_events.csv")
         if not os.path.exists(self.xp_log_path):
             with open(self.xp_log_path, "w") as f:
-                f.write("timestamp,xp_text,action_type,xp_type\n")
-
-        self.last_action = None
-        self.current_goal = self.load_goal()
+                f.write("timestamp,xp_text,action_type\n")
 
     def toggle_recording(self):
-        # Ensure the OSRS window is open
-        if not getattr(self.capture, 'window_found', False):
-            messagebox.showwarning(
-                "Window Not Found",
-                "Old School RuneScape window not detected. Please open the game before starting recording."
-            )
+        if not self.capture.window_found:
+            messagebox.showwarning("Window Not Found", "Please open OSRS before recording.")
             return
         if self.capture.running:
             self.capture.stop()
-            self.preview_running = False
-            self.status_var.set("Status: Idle")
+            self.mouse_listener.stop()
+            self.keyboard_listener.stop()
             self.toggle_button.config(text="Start Recording")
+            self.status_label.config(text="Status: Idle")
         else:
+            self.mouse_listener = mouse.Listener(on_click=self.on_click)
+            self.keyboard_listener = keyboard.Listener(on_press=self.on_key_press)
+            self.mouse_listener.start()
+            self.keyboard_listener.start()
             self.capture_thread = threading.Thread(target=self.capture.start, daemon=True)
             self.capture_thread.start()
-            self.preview_running = True
-            threading.Thread(target=self.update_preview_loop, daemon=True).start()
-            self.status_var.set("Status: Recording...")
             self.toggle_button.config(text="Stop Recording")
+            self.status_label.config(text="Status: Recording...")
 
-    def update_preview_loop(self):
-        while self.preview_running:
-            frame = np.array(self.capture.sct.grab(self.capture.screen_region))
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            img = Image.fromarray(frame)
-            img_tk = ImageTk.PhotoImage(image=img)
-            self.preview_canvas.configure(image=img_tk)
-            self.preview_canvas.image = img_tk
-            self.total_frames += 1
-            self.stats_label.config(
-                text=f"Frames: {self.total_frames} | Actions: {self.total_actions} | XP popups: {self.xp_popup_count} | Most common: {self.most_common_action()}"
-            )
-            self.root.update_idletasks()
-            self.root.after(100)
+    def on_click(self, x, y, button, pressed):
+        if pressed:
+            self.click_count += 1
+            self.capture.last_action = f"click_{button}"
+            self.total_actions += 1
+            self.update_stats_label()
+
+    def on_key_press(self, key):
+        k = getattr(key, 'char', str(key))
+        self.key_count += 1
+        self.capture.last_action = f"key_press_{k}"
+        self.total_actions += 1
+        self.update_stats_label()
 
     def track_action(self, action_type):
-        self.total_actions += 1
-        self.action_counts[action_type] = self.action_counts.get(action_type, 0) + 1
-        self.last_action = action_type
-        if action_type == "xp_popup":
+        if action_type == 'xp_popup':
             self.xp_popup_count += 1
             xp_text = self.capture.last_xp_text
-            xp_type = self.classify_xp_type_from_action(self.last_action)
-            self.log_xp_event(xp_text, self.last_action, xp_type)
-            self.update_xp_log_display(f"{xp_text} ({xp_type})")
-            self.update_xp_graph(xp_text, xp_type)
-
-    def classify_xp_type_from_action(self, action):
-        mapping = {"tree": "Woodcutting", "fishing_spot": "Fishing", "rock": "Mining", "range": "Cooking", "bank": "Banking"}
-        for key, skill in mapping.items():
-            if key in action:
-                return skill
-        return "Unknown"
-
-    def log_xp_event(self, xp_text, action_type, xp_type):
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        with open(self.xp_log_path, "a") as f:
-            f.write(f"{ts},{xp_text},{action_type},{xp_type}\n")
-
-    def update_xp_log_display(self, xp_entry):
-        self.xp_log_box.insert(0, xp_entry)
-        if self.xp_log_box.size() > 5:
-            self.xp_log_box.delete(5)
-
-    def update_xp_graph(self, xp_text, xp_type):
-        try:
-            xp_value = int(''.join(filter(str.isdigit, xp_text)))
-            ts = datetime.now()
-            self.xp_history.append((xp_type, xp_value, ts))
+            ts = datetime.now().strftime('%H:%M:%S')
+            last_act = getattr(self.capture, 'last_action', 'none')
+            self.xp_log_box.insert(0, f"{ts} {xp_text}  [last: {last_act}]")
+            if self.xp_log_box.size() > 20:
+                self.xp_log_box.delete(tk.END)
+            try:
+                val = int(re.sub(r"\D+", "", xp_text))
+            except:
+                val = 0
+            self.xp_history.append(val)
             self.ax.clear()
-            skills = list({t for t, _, _ in self.xp_history[-100:]})
-            for skill in skills:
-                pts = [(i, v) for i, (t, v, _) in enumerate(self.xp_history[-100:]) if t == skill]
-                xs, ys = zip(*pts)
-                dur = (self.xp_history[-1][2] - self.xp_history[-len(pts)][2]).total_seconds()
-                rate = (sum(ys) / dur) * 3600 if dur > 0 else 0
-                lbl = f"{skill} ({rate:.0f} XP/hr)"
-                line, = self.ax.plot(xs, ys, marker='o', label=lbl)
-                for x, y in pts:
-                    self.ax.annotate(str(y), (x, y), fontsize=8, textcoords='offset points', xytext=(0,5), ha='center')
-            self.ax.set_title("XP Over Time by Skill")
-            self.ax.set_ylabel("XP")
-            self.ax.set_xlabel("Event #")
-            self.ax.legend()
-            self.ax.grid(True)
-            self.canvas.mpl_connect("motion_notify_event", self.on_hover)
+            self.ax.plot(self.xp_history, marker='o')
+            self.ax.set_title('XP Over Time')
             self.canvas.draw()
-            self.update_xp_summary()
-        except ValueError:
-            pass
+            self.click_count = 0
+            self.key_count = 0
+        self.update_stats_label()
 
-    def on_hover(self, event):
-        if event.inaxes == self.ax:
-            for line in self.ax.get_lines():
-                cont, ind = line.contains(event)
-                if cont:
-                    i = ind['ind'][0]
-                    lbl = line.get_label()
-                    x, y = line.get_xdata()[i], line.get_ydata()[i]
-                    self.tooltip.set(f"{lbl}: {int(y)} XP at Event {int(x)}")
-                    return
-        self.tooltip.set("")
-
-    def load_goal(self):
-        if os.path.exists(self.goal_path):
-            with open(self.goal_path) as f:
-                return json.load(f).get("skill")
-        return None
-
-    def save_goal(self, skill):
-        with open(self.goal_path, 'w') as f:
-            json.dump({"skill": skill}, f)
+    def update_stats_label(self):
+        self.stats_label.config(
+            text=f"Actions: {self.total_actions} | XP: {self.xp_popup_count} | Clicks: {self.click_count} | Keys: {self.key_count}"
+        )
 
     def reset_summary(self):
         self.xp_history.clear()
         self.ax.clear()
         self.canvas.draw()
-        self.update_xp_summary()
-
-    def update_xp_summary(self):
-        self.xp_summary_box.delete(0, tk.END)
-        totals = {}
-        for t, v, _ in self.xp_history:
-            totals[t] = totals.get(t, 0) + v
-        for skill, total in sorted(totals.items(), key=lambda x: -x[1]):
-            elapsed = max((datetime.now() - datetime.fromtimestamp(os.path.getmtime(self.xp_log_path))).total_seconds(), 1)
-            rate = (total / elapsed) * 3600
-            self.xp_summary_box.insert(tk.END, f"{skill}: {total} XP ({rate:.1f} XP/hr)")
+        self.xp_log_box.delete(0, tk.END)
 
 class ActionRecommender:
     def __init__(self, xp_data_path="data/clean_xp_data.csv"):
-        import pandas as pd, joblib
-        self.model = joblib.load("models/xp_predictor.pkl")
+        try:
+            self.model = joblib.load("models/xp_predictor.pkl")
+            self.model_loaded = True
+        except FileNotFoundError:
+            messagebox.showerror("Model Not Found", "XP predictor model not found.\nPlease train the model first.")
+            self.model_loaded = False
+            self.action_map, self.inverse_xp_map = {}, {}
+            return
         df = pd.read_csv(xp_data_path)
         cats = df["action_type"].astype("category")
         self.action_map = dict(enumerate(cats.cat.categories))
         cats2 = df["xp_type"].astype("category")
-        self.xp_type_map = dict(enumerate(cats2.cat.categories))
-        self.inverse_action_map = {v:k for k,v in self.action_map.items()}
-        self.inverse_xp_map = {v:k for k,v in self.xp_type_map.items()}
+        self.inverse_xp_map = {v: k for k, v in enumerate(cats2.cat.categories)}
 
     def recommend(self, xp_type):
+        if not getattr(self, 'model_loaded', False):
+            return 'click', 0.0
         xp_id = self.inverse_xp_map.get(xp_type, 0)
         preds = [(aid, self.model.predict([[aid, xp_id]])[0]) for aid in self.action_map]
         best = max(preds, key=lambda x: x[1])
@@ -277,9 +244,9 @@ class AutoPlayer:
             for b in r.boxes:
                 name = r.names[int(b.cls[0])]
                 if label == f"click_{name}":
-                    x1,y1,x2,y2 = map(int,b.xyxy[0])
-                    cx=(x1+x2)//2+region["left"]
-                    cy=(y1+y2)//2+region["top"]
+                    x1,y1,x2,y2 = map(int, b.xyxy[0])
+                    cx = (x1+x2)//2 + region["left"]
+                    cy = (y1+y2)//2 + region["top"]
                     pyautogui.moveTo(cx, cy, duration=0.2)
                     pyautogui.click()
                     return
@@ -288,56 +255,61 @@ class GoalSettingUI:
     def __init__(self, root, recommender, autoplayer):
         self.recommender = recommender
         self.autoplayer = autoplayer
-        self.frame = tk.Frame(root)
-        self.frame.pack(pady=10)
-        tk.Label(self.frame, text="Skill Goal:").pack()
-        self.skill_entry = tk.Entry(self.frame)
-        self.skill_entry.pack()
-        tk.Button(self.frame, text="Recommend", command=self.recommend_action).pack()
-        tk.Button(self.frame, text="Auto-Play", command=self.auto_play_action).pack()
-        tk.Label(self.frame, text="Multi-Step Goal (Skill:Count,...):").pack()
-        self.multi_entry = tk.Entry(self.frame, width=40)
-        self.multi_entry.pack()
-        tk.Button(self.frame, text="Start Multi-Step Goal", command=self.start_multi_step_goal).pack()
-        self.step_tracker_label = tk.Label(self.frame, text="")
-        self.step_tracker_label.pack(pady=5)
+        frame = tk.Frame(root)
+        frame.pack(fill="x", pady=5)
+        tk.Label(frame, text="Skill Goal:").pack(anchor="w")
+        self.skill_entry = tk.Entry(frame)
+        self.skill_entry.pack(fill="x")
+        tk.Button(frame, text="Recommend", command=self.recommend_action).pack(pady=2)
+        tk.Button(frame, text="Auto-Play", command=self.auto_play_action).pack(pady=2)
+        tk.Label(frame, text="Multi-Step Goal (Skill:Count,...):").pack(anchor="w")
+        self.multi_entry = tk.Entry(frame)
+        self.multi_entry.pack(fill="x")
+        tk.Button(frame, text="Start Multi-Step Goal", command=self.start_multi_step_goal).pack(pady=2)
+        self.step_tracker_label = tk.Label(frame, text="")
+        self.step_tracker_label.pack(pady=2)
         self.recommendation = tk.StringVar()
-        tk.Label(self.frame, textvariable=self.recommendation, fg="blue").pack()
+        tk.Label(frame, textvariable=self.recommendation, fg="blue").pack()
+
     def recommend_action(self):
         skill = self.skill_entry.get().strip()
         if not skill:
             self.recommendation.set("Enter a skill.")
             return
         self.autoplayer.set_goal(skill)
-        action,xp = self.recommender.recommend(skill)
+        action, xp = self.recommender.recommend(skill)
         self.recommendation.set(f"Try: {action} (est. {xp:.1f} XP)")
+
     def auto_play_action(self):
         self.autoplayer.perform_best_action()
         self.update_step_tracker()
+
     def start_multi_step_goal(self):
         s = self.multi_entry.get().strip()
         try:
-            steps=[(ss.split(":")[0].strip(),int(ss.split(":")[1])) for ss in s.split(",")]
+            steps = [(ss.split(":")[0].strip(), int(ss.split(":")[1])) for ss in s.split(",")]
             self.autoplayer.set_multi_goal(steps)
             self.recommendation.set(f"Started multi-step: {steps}")
             self.update_step_tracker()
         except Exception as e:
             self.recommendation.set(f"Invalid format: {e}")
+
     def update_step_tracker(self):
-        mg=self.autoplayer.multi_goal
+        mg = self.autoplayer.multi_goal
         if mg:
-            idx=mg.current_index+1
-            total=len(mg.steps)
-            skill,target=mg.steps[mg.current_index]
-            cur=mg.current_count
+            idx = mg.current_index + 1
+            total = len(mg.steps)
+            skill, target = mg.steps[mg.current_index]
+            cur = mg.current_count
             self.step_tracker_label.config(text=f"Step {idx}/{total}: {skill} [{cur}/{target}]")
         else:
             self.step_tracker_label.config(text="")
 
 if __name__ == "__main__":
-    root=tk.Tk()
-    app=RecorderApp(root)
-    recommender=ActionRecommender()
-    autoplayer=AutoPlayer(recommender)
-    gui=GoalSettingUI(root,recommender,autoplayer)
+    root = tk.Tk()
+    app = RecorderApp(root)
+    recommender = ActionRecommender()
+    autoplayer = AutoPlayer(recommender)
+    app.goal_ui.recommender = recommender
+    app.goal_ui.autoplayer = autoplayer
     root.mainloop()
