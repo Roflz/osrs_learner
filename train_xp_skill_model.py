@@ -1,41 +1,50 @@
 #!/usr/bin/env python3
 import os
+import time
 import pandas as pd
 from PIL import Image
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, random_split
 
 from torchvision import transforms
 from torchvision.transforms import Grayscale, ToTensor
 from collections import Counter
 
-# ─── Hyperparameters ─────────────────────────────────────────────────────────
-LABEL_CSV   = "data/xp_labels.csv"
-CROP_DIR    = "data/xp_crops_labeled"
-BATCH_SIZE  = 32
-LR          = 1e-3
-EPOCHS      = 10
-DEVICE      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# ─── ANSI COLORS ──────────────────────────────────────────────────────────────
+RED     = '\033[91m'
+GREEN   = '\033[92m'
+YELLOW  = '\033[93m'
+BLUE    = '\033[94m'
+MAGENTA = '\033[95m'
+CYAN    = '\033[96m'
+RESET   = '\033[0m'
 
-# ─── Dataset ─────────────────────────────────────────────────────────────────
+# ─── Hyperparameters ─────────────────────────────────────────────────────────
+LABEL_CSV    = "data/xp_labels.csv"
+CROP_DIR     = "data/xp_crops_labeled"
+BATCH_SIZE   = 32
+LR           = 1e-3
+WEIGHT_DECAY = 1e-4
+EPOCHS       = 10
+VAL_FRAC     = 0.2
+PATIENCE     = 2
+FACTOR       = 0.5
+DEVICE       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ─── Dataset for XP & Skill ─────────────────────────────────────────────────
 class XPSD(Dataset):
     def __init__(self, label_csv, crop_dir, transform=None):
-        # Load and clean CSV
         df = pd.read_csv(label_csv)
-        df['drop']  = df['drop'].fillna('no').astype(str)
-        df = df[df['drop'].str.lower() == 'yes'].reset_index(drop=True)
+        df['drop']  = df['drop'].fillna('no').str.lower()
+        df = df[df['drop'] == 'yes'].reset_index(drop=True)
         df['skill'] = df['skill'].fillna('').astype(str)
         df = df[df['skill'] != ''].reset_index(drop=True)
         self.df = df
-
-        # Build skill mapping
         skills = sorted(df['skill'].unique().tolist())
         self.skill_to_idx = {s: i for i, s in enumerate(skills)}
-        self.idx_to_skill = {i: s for s, i in self.skill_to_idx.items()}
-
         self.crop_dir  = crop_dir
         self.transform = transform
 
@@ -44,137 +53,210 @@ class XPSD(Dataset):
 
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
-        # load image
         img = Image.open(os.path.join(self.crop_dir, row['filename'])).convert("RGB")
-        if self.transform:
-            img = self.transform(img)
-        else:
-            img = ToTensor()(img)
+        img = self.transform(img) if self.transform else ToTensor()(img)
+        xp         = torch.tensor(float(row['value']) if row['value'] else 0.0,
+                                  dtype=torch.float32)
+        skill_idx  = self.skill_to_idx[row['skill']]
+        drop_label = 1
+        return img, xp, skill_idx, drop_label
 
-        # xp as FloatTensor
-        raw_xp = float(row['value']) if row['value'] else 0.0
-        xp     = torch.tensor(raw_xp, dtype=torch.float32)
+# ─── Dataset for Drop Detection ───────────────────────────────────────────────
+class DropDataset(Dataset):
+    def __init__(self, label_csv, crop_dir, transform=None):
+        df = pd.read_csv(label_csv)
+        df['drop'] = df['drop'].fillna('no').str.lower()
+        self.df = df.reset_index(drop=True)
+        self.crop_dir  = crop_dir
+        self.transform = transform
 
-        # skill + drop
-        skill_idx = self.skill_to_idx[row['skill']]
-        drop_lbl  = 1  # always 1 here
+    def __len__(self):
+        return len(self.df)
 
-        return img, xp, skill_idx, drop_lbl
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        img = Image.open(os.path.join(self.crop_dir, row['filename'])).convert("RGB")
+        img = self.transform(img) if self.transform else ToTensor()(img)
+        drop_lbl = 1 if row['drop'] == 'yes' else 0
+        return img, drop_lbl
 
 # ─── Models ──────────────────────────────────────────────────────────────────
 class XPRegressor(nn.Module):
     def __init__(self):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Conv2d(1, 16, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
-            nn.Conv2d(16,32,3,padding=1),   nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(1,16,3,padding=1), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(16,32,3,padding=1),nn.ReLU(), nn.MaxPool2d(2),
             nn.Flatten(),
-            nn.Linear(32 * 16 * 16, 128),   nn.ReLU(), nn.Dropout(0.5),
-            nn.Linear(128, 1)
+            nn.Linear(32*16*16,128),     nn.ReLU(), nn.Dropout(0.5),
+            nn.Linear(128,1)
         )
-    def forward(self, x):
-        return self.net(x).squeeze(1)
+    def forward(self,x): return self.net(x).squeeze(1)
 
 class SkillClassifier(nn.Module):
     def __init__(self, n_skills):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Conv2d(1, 16, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
-            nn.Conv2d(16,32,3,padding=1),   nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(1,16,3,padding=1), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(16,32,3,padding=1),nn.ReLU(), nn.MaxPool2d(2),
             nn.Flatten(),
-            nn.Linear(32 * 16 * 16, 128),   nn.ReLU(), nn.Dropout(0.5),
-            nn.Linear(128, n_skills)
+            nn.Linear(32*16*16,128),     nn.ReLU(), nn.Dropout(0.5),
+            nn.Linear(128,n_skills)
         )
-    def forward(self, x):
-        return self.net(x)
+    def forward(self,x): return self.net(x)
+
+class DropDetector(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(1,16,3,padding=1), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(16,32,3,padding=1),nn.ReLU(), nn.MaxPool2d(2),
+            nn.Flatten(),
+            nn.Linear(32*16*16,64),      nn.ReLU(), nn.Dropout(0.5),
+            nn.Linear(64,1),             nn.Sigmoid()
+        )
+    def forward(self,x): return self.net(x).squeeze(1)
 
 # ─── Training Routines ───────────────────────────────────────────────────────
-def train_regressor(model, loader, optimizer, loss_fn):
+def train_regressor(model, loader, opt, loss_fn):
     model.train()
-    total_loss = 0.0
-    total_sq   = 0.0
-    count      = 0
-    for imgs, xp_true, _, _ in loader:
+    total_sq, count = 0., 0
+    for imgs, xp_true, *_ in loader:
         imgs, xp_true = imgs.to(DEVICE), xp_true.to(DEVICE)
         preds = model(imgs)
         loss  = loss_fn(preds, xp_true)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        opt.zero_grad(); loss.backward(); opt.step()
+        total_sq += ((preds-xp_true)**2).sum().item()
+        count    += xp_true.size(0)
+    return total_sq/count, (total_sq/count)**0.5
 
-        total_loss += loss.item() * xp_true.size(0)
-        total_sq   += ((preds - xp_true) ** 2).sum().item()
-        count     += xp_true.size(0)
-    mse  = total_sq / count
-    rmse = mse ** 0.5
-    return mse, rmse
-
-def train_classifier(model, loader, optimizer, loss_fn):
+def train_classifier(model, loader, opt, loss_fn):
     model.train()
-    correct = 0
-    total   = 0
-    total_loss = 0.0
+    total_loss, correct, total = 0., 0, 0
     for imgs, _, skill_true, _ in loader:
-        imgs = imgs.to(DEVICE)
-        skill_true = skill_true.to(DEVICE)
+        imgs, skill_true = imgs.to(DEVICE), skill_true.to(DEVICE)
         logits = model(imgs)
-        loss = loss_fn(logits, skill_true)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-        total_loss += loss.item() * imgs.size(0)
-        preds = logits.argmax(dim=1)
-        correct += (preds == skill_true).sum().item()
+        loss   = loss_fn(logits, skill_true)
+        opt.zero_grad(); loss.backward(); opt.step()
+        total_loss += loss.item()*imgs.size(0)
+        preds = logits.argmax(1)
+        correct += (preds==skill_true).sum().item()
         total   += imgs.size(0)
+    return total_loss/total, correct/total if total>0 else 0.0
 
-    ce  = total_loss / total
-    acc = correct / total if total>0 else 0.0
-    return ce, acc
+def train_detector(model, loader, opt, loss_fn):
+    model.train()
+    total_loss, correct, total = 0., 0, 0
+    for imgs, drop_true in loader:
+        imgs, drop_true = imgs.to(DEVICE), drop_true.to(DEVICE).float()
+        preds = model(imgs)
+        loss  = loss_fn(preds, drop_true)
+        opt.zero_grad(); loss.backward(); opt.step()
+        total_loss += loss.item()*imgs.size(0)
+        pred_lbl = (preds>0.5).long()
+        correct  += (pred_lbl==drop_true.long()).sum().item()
+        total    += imgs.size(0)
+    return total_loss/total, correct/total if total>0 else 0.0
 
 # ─── Main Pipeline ──────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    print("== Starting Training Pipeline ==")
+if __name__=="__main__":
+    start_time = time.time()
+    print(f"{CYAN}== Starting Training Pipeline =={RESET}\n")
 
-    # transforms & dataset
-    train_transform = transforms.Compose([
-        transforms.Resize((64, 64)),
+    # transforms
+    transform = transforms.Compose([
+        transforms.Resize((64,64)),
         Grayscale(num_output_channels=1),
-        transforms.ToTensor(),
+        ToTensor()
     ])
 
-    ds = XPSD(LABEL_CSV, CROP_DIR, transform=train_transform)
-    train_loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True)
+    # XP+Skill dataset & split
+    xpds = XPSD(LABEL_CSV, CROP_DIR, transform)
+    n_val = int(len(xpds)*VAL_FRAC); n_trn = len(xpds) - n_val
+    xp_tr, xp_vl = random_split(xpds, [n_trn, n_val])
+    tr_xp = DataLoader(xp_tr, batch_size=BATCH_SIZE, shuffle=True)
+    vl_xp = DataLoader(xp_vl, batch_size=BATCH_SIZE, shuffle=False)
 
-    # diagnostic & skip logic
-    skill_names = list(ds.skill_to_idx.keys())
-    print(f"Found skill classes: {skill_names}")
-    skip_clf = len(skill_names) < 2
-    if skip_clf:
-        print("⚠️ Need ≥2 distinct skills to train classifier; skipping.")
+    # Drop detector dataset & split
+    dd = DropDataset(LABEL_CSV, CROP_DIR, transform)
+    n_val2 = int(len(dd)*VAL_FRAC); n_trn2 = len(dd) - n_val2
+    dd_tr, dd_vl = random_split(dd, [n_trn2, n_val2])
+    tr_dd = DataLoader(dd_tr, batch_size=BATCH_SIZE, shuffle=True)
+    vl_dd = DataLoader(dd_vl, batch_size=BATCH_SIZE, shuffle=False)
 
-    # model + optimizer + losses
+    # Diagnostics & sample counts
+    skill_names = list(xpds.skill_to_idx.keys())
+    print(f"{YELLOW}XP dataset samples:{RESET} train={len(xp_tr)}  val={len(xp_vl)}")
+    print(f"{YELLOW}Drop dataset samples:{RESET} train={len(dd_tr)}  val={len(dd_vl)}")
+    print(f"{YELLOW}Skill classes:{RESET} {skill_names}")
+    use_clf = len(skill_names) >= 2
+    if not use_clf:
+        print(f"{RED}⚠️ Skipping skill classifier (need ≥2 skills).{RESET}")
+    drop_labels = set(dd.df['drop'].tolist())
+    use_dd = drop_labels == {'yes', 'no'}
+    if not use_dd:
+        print(f"{RED}⚠️ Skipping drop detector (need yes & no).{RESET}")
+    print()
+
+    # instantiate models, optimizers, schedulers, losses
     xp_model = XPRegressor().to(DEVICE)
-    xp_opt   = optim.Adam(xp_model.parameters(), lr=LR)
-    mse_loss = nn.MSELoss()
+    xp_opt   = optim.Adam(xp_model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    xp_sched = optim.lr_scheduler.ReduceLROnPlateau(xp_opt, mode='min',
+                  factor=FACTOR, patience=PATIENCE, verbose=True)
+    xp_loss  = nn.MSELoss()
 
-    if not skip_clf:
+    if use_clf:
         sc_model = SkillClassifier(len(skill_names)).to(DEVICE)
-        sc_opt   = optim.Adam(sc_model.parameters(), lr=LR)
-        ce_loss  = nn.CrossEntropyLoss()
+        sc_opt   = optim.Adam(sc_model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+        sc_sched = optim.lr_scheduler.ReduceLROnPlateau(sc_opt, mode='max',
+                      factor=FACTOR, patience=PATIENCE, verbose=True)
+        sc_loss  = nn.CrossEntropyLoss()
 
-    # train loop
-    tr_mse, tr_rmse = train_regressor(xp_model, train_loader, xp_opt, mse_loss)
-    print(f"Regressor -> MSE: {tr_mse:.4f}, RMSE: {tr_rmse:.4f}")
+    if use_dd:
+        dd_model = DropDetector().to(DEVICE)
+        dd_opt   = optim.Adam(dd_model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+        dd_sched = optim.lr_scheduler.ReduceLROnPlateau(dd_opt, mode='max',
+                      factor=FACTOR, patience=PATIENCE, verbose=True)
+        dd_loss  = nn.BCELoss()
 
-    if not skip_clf:
-        tr_ce, tr_acc = train_classifier(sc_model, train_loader, sc_opt, ce_loss)
-        print(f"Classifier -> CE: {tr_ce:.4f}, Acc: {tr_acc*100:.1f}%")
+    # Training loops
+    print(f"{GREEN}-- Training XP Regressor --{RESET}")
+    for epoch in range(1, EPOCHS+1):
+        mse_tr, rmse_tr = train_regressor(xp_model, tr_xp, xp_opt, xp_loss)
+        mse_vl, _       = train_regressor(xp_model, vl_xp, xp_opt, xp_loss)
+        xp_sched.step(mse_vl)
+        lr = xp_opt.param_groups[0]['lr']
+        print(f"{GREEN}Epoch {epoch}/{EPOCHS}{RESET}"
+              f" train RMSE={rmse_tr:.3f}, val MSE={mse_vl:.3f}"
+              f" | {CYAN}LR={lr:.1e}{RESET}")
 
-    # save models
+    if use_clf:
+        print(f"\n{BLUE}-- Training Skill Classifier --{RESET}")
+        for epoch in range(1, EPOCHS+1):
+            ce_tr, acc_tr = train_classifier(sc_model, tr_xp, sc_opt, sc_loss)
+            ce_vl, acc_vl = train_classifier(sc_model, vl_xp, sc_opt, sc_loss)
+            sc_sched.step(acc_vl)
+            lr = sc_opt.param_groups[0]['lr']
+            print(f"{BLUE}Epoch {epoch}/{EPOCHS}{RESET}"
+                  f" train Acc={acc_tr*100:.1f}%, val Acc={acc_vl*100:.1f}%"
+                  f" | {CYAN}LR={lr:.1e}{RESET}")
+
+    if use_dd:
+        print(f"\n{MAGENTA}-- Training Drop Detector --{RESET}")
+        for epoch in range(1, EPOCHS+1):
+            ld_tr, la_tr = train_detector(dd_model, tr_dd, dd_opt, dd_loss)
+            ld_vl, la_vl = train_detector(dd_model, vl_dd, dd_opt, dd_loss)
+            dd_sched.step(la_vl)
+            lr = dd_opt.param_groups[0]['lr']
+            print(f"{MAGENTA}Epoch {epoch}/{EPOCHS}{RESET}"
+                  f" train Acc={la_tr*100:.1f}%, val Acc={la_vl*100:.1f}%"
+                  f" | {CYAN}LR={lr:.1e}{RESET}")
+
+    # Save models
     os.makedirs("models", exist_ok=True)
     torch.save(xp_model.state_dict(),  "models/xp_regressor.pth")
-    if not skip_clf:
-        torch.save(sc_model.state_dict(), "models/skill_classifier.pth")
+    if use_clf: torch.save(sc_model.state_dict(),  "models/skill_classifier.pth")
+    if use_dd:  torch.save(dd_model.state_dict(),  "models/xp_detector.pth")
 
-    print("== Training complete ==")
+    elapsed = (time.time() - start_time) / 60
+    print(f"\n{CYAN}== Done in {elapsed:.1f} min =={RESET}")
