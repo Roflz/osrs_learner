@@ -1,242 +1,245 @@
-#!/usr/bin/env python3
+import tkinter as tk
+from tkinter import messagebox
+import json
 import os
-import pandas as pd
-from PIL import Image
+import csv
+import threading
 import time
+from datetime import datetime
+from mss import mss, tools
+import pygetwindow as gw
+from pynput import mouse, keyboard
+from PIL import Image
+import numpy as np
 
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader, random_split
+# == CONFIG ==
+DATA_DIR = "data"
+REGION_FILE = os.path.join(DATA_DIR, "popup_region.json")
+SCREENSHOT_DIR = os.path.join(DATA_DIR, "screenshots")
+XP_CROP_DIR = os.path.join(DATA_DIR, "xp_crops")
+ACTION_LOG = os.path.join(DATA_DIR, "actions.csv")
 
-from torchvision import transforms
-from torchvision.transforms import Grayscale, ToTensor
-from collections import Counter
+class XPRecorder:
+    def __init__(self, root):
+        self.root = root
+        root.title("OSRS Data Recorder")
+        root.geometry("360x280")
 
-# ─── ANSI COLORS ──────────────────────────────────────────────────────────────
-RED     = '\033[91m'
-GREEN   = '\033[92m'
-YELLOW  = '\033[93m'
-BLUE    = '\033[94m'
-MAGENTA = '\033[95m'
-CYAN    = '\033[96m'
-RESET   = '\033[0m'
-
-# ─── Hyperparameters ─────────────────────────────────────────────────────────
-LABEL_CSV   = "data/xp_labels.csv"
-CROP_DIR    = "data/xp_crops_labeled"
-BATCH_SIZE  = 32
-LR          = 1e-3
-EPOCHS      = 10
-VAL_FRAC    = 0.2
-DEVICE      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# ─── Dataset for XP & Skill ─────────────────────────────────────────────────
-class XPSD(Dataset):
-    def __init__(self, label_csv, crop_dir, transform=None):
-        df = pd.read_csv(label_csv)
-        df['drop']  = df['drop'].fillna('no').astype(str).str.lower()
-        df = df[df['drop'] == 'yes'].reset_index(drop=True)
-        df['skill'] = df['skill'].fillna('').astype(str)
-        df = df[df['skill'] != ''].reset_index(drop=True)
-        self.df = df
-
-        skills = sorted(df['skill'].unique().tolist())
-        self.skill_to_idx = {s:i for i,s in enumerate(skills)}
-        self.idx_to_skill = {i:s for s,i in self.skill_to_idx.items()}
-
-        self.crop_dir  = crop_dir
-        self.transform = transform
-
-    def __len__(self):
-        return len(self.df)
-
-    def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-        img = Image.open(os.path.join(self.crop_dir, row['filename'])).convert("RGB")
-        img = self.transform(img) if self.transform else ToTensor()(img)
-
-        xp = torch.tensor(float(row['value']) if row['value'] else 0.0,
-                          dtype=torch.float32)
-        skill_idx = self.skill_to_idx[row['skill']]
-        drop_lbl  = 1
-        return img, xp, skill_idx, drop_lbl
-
-# ─── Dataset for Drop Detection ───────────────────────────────────────────────
-class DropDataset(Dataset):
-    def __init__(self, label_csv, crop_dir, transform=None):
-        df = pd.read_csv(label_csv)
-        df['drop'] = df['drop'].fillna('no').str.lower()
-        self.df = df.reset_index(drop=True)
-
-        self.crop_dir  = crop_dir
-        self.transform = transform
-
-    def __len__(self):
-        return len(self.df)
-
-    def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-        img = Image.open(os.path.join(self.crop_dir, row['filename'])).convert("RGB")
-        img = self.transform(img) if self.transform else ToTensor()(img)
-
-        drop_lbl = 1 if row['drop'] == 'yes' else 0
-        return img, drop_lbl
-
-# ─── Models ──────────────────────────────────────────────────────────────────
-class XPRegressor(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(1,16,3,padding=1), nn.ReLU(), nn.MaxPool2d(2),
-            nn.Conv2d(16,32,3,padding=1),nn.ReLU(), nn.MaxPool2d(2),
-            nn.Flatten(),
-            nn.Linear(32*16*16,128),     nn.ReLU(), nn.Dropout(0.5),
-            nn.Linear(128,1)
+        # Interval slider
+        slider_frame = tk.Frame(root)
+        slider_frame.pack(pady=5)
+        tk.Label(slider_frame, text="Capture interval (s):").pack(side="left")
+        self.interval_var = tk.DoubleVar(value=0.6)
+        self.interval_slider = tk.Scale(
+            slider_frame,
+            variable=self.interval_var,
+            from_=0.1,
+            to=2.0,
+            resolution=0.1,
+            orient="horizontal",
+            length=200,
         )
-    def forward(self,x): return self.net(x).squeeze(1)
+        self.interval_slider.pack(side="left", padx=5)
 
-class SkillClassifier(nn.Module):
-    def __init__(self, n_skills):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(1,16,3,padding=1), nn.ReLU(), nn.MaxPool2d(2),
-            nn.Conv2d(16,32,3,padding=1),nn.ReLU(), nn.MaxPool2d(2),
-            nn.Flatten(),
-            nn.Linear(32*16*16,128),     nn.ReLU(), nn.Dropout(0.5),
-            nn.Linear(128,n_skills)
-        )
-    def forward(self,x): return self.net(x)
+        # Region selector
+        tk.Button(root, text="Select XP Region", command=self.select_region).pack(pady=3)
+        self.show_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(
+            root,
+            text="Show XP Overlay",
+            variable=self.show_var,
+            command=self.toggle_overlay
+        ).pack(pady=3)
 
-class DropDetector(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(1,16,3,padding=1), nn.ReLU(), nn.MaxPool2d(2),
-            nn.Conv2d(16,32,3,padding=1),nn.ReLU(), nn.MaxPool2d(2),
-            nn.Flatten(),
-            nn.Linear(32*16*16,64),      nn.ReLU(), nn.Dropout(0.5),
-            nn.Linear(64,1),             nn.Sigmoid()
-        )
-    def forward(self,x): return self.net(x).squeeze(1)
+        # Recording control
+        self.recording = False
+        self.record_button = tk.Button(root, text="Start Recording", command=self.toggle_recording)
+        self.record_button.pack(pady=5)
 
-# ─── Training Routines ───────────────────────────────────────────────────────
-def train_regressor(model, loader, opt, loss_fn):
-    model.train()
-    total_sq, count = 0., 0
-    for imgs, xp_true, _, _ in loader:
-        imgs, xp_true = imgs.to(DEVICE), xp_true.to(DEVICE)
-        preds = model(imgs)
-        loss  = loss_fn(preds, xp_true)
-        opt.zero_grad(); loss.backward(); opt.step()
-        total_sq += ((preds-xp_true)**2).sum().item()
-        count    += xp_true.size(0)
-    return total_sq/count, (total_sq/count)**0.5
+        # Status counters frame
+        status_frame = tk.Frame(root)
+        status_frame.pack(fill="x", pady=5)
+        self.click_count = 0
+        self.key_count = 0
+        self.shot_count = 0
+        self.crop_count = 0
+        self.click_label = tk.Label(status_frame, text="Clicks: 0")
+        self.key_label = tk.Label(status_frame, text="Keys: 0")
+        self.shot_label = tk.Label(status_frame, text="Screenshots: 0")
+        self.crop_label = tk.Label(status_frame, text="XP Crops: 0")
+        for lbl in (self.click_label, self.key_label, self.shot_label, self.crop_label):
+            lbl.pack(side="left", padx=5)
 
-def train_classifier(model, loader, opt, loss_fn):
-    model.train()
-    total_loss, correct, total = 0., 0, 0
-    for imgs, _, skill_true, _ in loader:
-        imgs, skill_true = imgs.to(DEVICE), skill_true.to(DEVICE)
-        logits = model(imgs)
-        loss   = loss_fn(logits, skill_true)
-        opt.zero_grad(); loss.backward(); opt.step()
-        total_loss += loss.item()*imgs.size(0)
-        preds = logits.argmax(1)
-        correct += (preds==skill_true).sum().item()
-        total   += imgs.size(0)
-    return total_loss/total, correct/total if total>0 else 0.0
+        # Internal queues and control
+        self.popup_region = None
+        self.overlay = None
+        self.click_queue = []
+        self.key_queue = []
+        self.stop_event = threading.Event()
 
-def train_detector(model, loader, opt, loss_fn):
-    model.train()
-    total_loss, correct, total = 0., 0, 0
-    for imgs, drop_true in loader:
-        imgs, drop_true = imgs.to(DEVICE), drop_true.to(DEVICE).float()
-        preds = model(imgs)
-        loss  = loss_fn(preds, drop_true)
-        opt.zero_grad(); loss.backward(); opt.step()
-        total_loss += loss.item()*imgs.size(0)
-        pred_lbl = (preds>0.5).long()
-        correct  += (pred_lbl==drop_true.long()).sum().item()
-        total    += imgs.size(0)
-    return total_loss/total, correct/total if total>0 else 0.0
+        # Ensure storage
+        os.makedirs(DATA_DIR, exist_ok=True)
+        os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+        os.makedirs(XP_CROP_DIR, exist_ok=True)
+        if os.path.exists(REGION_FILE):
+            with open(REGION_FILE, 'r') as f:
+                self.popup_region = json.load(f)
 
-# ─── Main Pipeline ──────────────────────────────────────────────────────────
-if __name__=="__main__":
-    print(f"{CYAN}== Starting Training Pipeline =={RESET}\n")
+    def select_region(self):
+        wins = gw.getWindowsWithTitle("Old School RuneScape")
+        if not wins:
+            messagebox.showerror("Error", "OSRS window not found.")
+            return
+        w = wins[0]
+        selector = tk.Toplevel(self.root)
+        selector.overrideredirect(True)
+        selector.geometry(f"{w.width}x{w.height}+{w.left}+{w.top}")
+        selector.attributes("-alpha", 0.25)
+        selector.attributes("-topmost", True)
+        canvas = tk.Canvas(selector, cursor="cross")
+        canvas.pack(fill="both", expand=True)
 
-    # build transforms
-    transform = transforms.Compose([
-        transforms.Resize((64,64)),
-        Grayscale(num_output_channels=1),
-        ToTensor()
-    ])
+        coords = {}
+        def on_press(event):
+            coords['x1'], coords['y1'] = event.x, event.y
+        def on_drag(event):
+            canvas.delete('rect')
+            canvas.create_rectangle(
+                coords['x1'], coords['y1'], event.x, event.y,
+                outline='red', width=2, tag='rect'
+            )
+        def on_release(event):
+            coords['x2'], coords['y2'] = event.x, event.y
+            selector.destroy()
+            x1, y1 = coords['x1'], coords['y1']
+            x2, y2 = coords['x2'], coords['y2']
+            self.popup_region = {
+                'left': min(x1, x2),
+                'top': min(y1, y2),
+                'width': abs(x2 - x1),
+                'height': abs(y2 - y1)
+            }
+            with open(REGION_FILE, 'w') as f:
+                json.dump(self.popup_region, f)
+            messagebox.showinfo("Saved", f"Region: {self.popup_region}")
+        canvas.bind('<ButtonPress-1>', on_press)
+        canvas.bind('<B1-Motion>', on_drag)
+        canvas.bind('<ButtonRelease-1>', on_release)
 
-    # XP+Skill dataset & split
-    xpds = XPSD(LABEL_CSV, CROP_DIR, transform)
-    n_val = int(len(xpds)*VAL_FRAC); n_trn = len(xpds)-n_val
-    xp_tr, xp_vl = random_split(xpds, [n_trn, n_val])
-    tr_xp = DataLoader(xp_tr, batch_size=BATCH_SIZE, shuffle=True)
-    vl_xp = DataLoader(xp_vl, batch_size=BATCH_SIZE, shuffle=False)
+    def toggle_overlay(self):
+        if not self.show_var.get():
+            if self.overlay:
+                self.overlay.destroy()
+                self.overlay = None
+            return
+        if not self.popup_region:
+            messagebox.showwarning("No region", "Select region first.")
+            self.show_var.set(False)
+            return
+        wins = gw.getWindowsWithTitle("Old School RuneScape")
+        if not wins:
+            messagebox.showerror("Error", "OSRS window not found.")
+            self.show_var.set(False)
+            return
+        w = wins[0]
+        pr = self.popup_region
+        abs_left = w.left + pr['left']
+        abs_top  = w.top  + pr['top']
+        if self.overlay:
+            self.overlay.destroy()
+        self.overlay = tk.Toplevel(self.root)
+        self.overlay.overrideredirect(True)
+        self.overlay.geometry(f"{pr['width']}x{pr['height']}+{abs_left}+{abs_top}")
+        self.overlay.attributes('-alpha',0.3)
+        self.overlay.attributes('-topmost',True)
+        tk.Frame(self.overlay,bg='red').pack(fill='both',expand=True)
 
-    # Drop detector dataset & split
-    dd = DropDataset(LABEL_CSV, CROP_DIR, transform)
-    n_val2 = int(len(dd)*VAL_FRAC); n_trn2 = len(dd)-n_val2
-    dd_tr, dd_vl = random_split(dd, [n_trn2, n_val2])
-    tr_dd = DataLoader(dd_tr, batch_size=BATCH_SIZE, shuffle=True)
-    vl_dd = DataLoader(dd_vl, batch_size=BATCH_SIZE, shuffle=False)
+    def toggle_recording(self):
+        if not self.recording:
+            self.start_recording()
+        else:
+            self.stop_recording()
 
-    # Diagnostics
-    skill_names = list(xpds.skill_to_idx.keys())
-    print(f"{YELLOW}XP dataset size:{RESET} train={len(xp_tr)}  val={len(xp_vl)}")
-    print(f"{YELLOW}Drop dataset size:{RESET} train={len(dd_tr)}  val={len(dd_vl)}")
-    print(f"{YELLOW}Skill classes:{RESET} {skill_names}")
-    use_clf = len(skill_names)>=2
-    if not use_clf:
-        print(f"{RED}⚠️ Skipping skill classifier (need ≥2 skills).{RESET}")
-    drop_labels = set(dd.df['drop'].tolist())
-    use_dd = drop_labels=={'yes','no'}
-    if not use_dd:
-        print(f"{RED}⚠️ Skipping drop detector (need both yes/no).{RESET}")
-    print()
+    def start_recording(self):
+        self.interval = self.interval_var.get()
+        newf = not os.path.exists(ACTION_LOG)
+        self.csvf = open(ACTION_LOG, 'a', newline='')
+        self.writer = csv.writer(self.csvf)
+        if newf:
+            self.writer.writerow(['timestamp','img','mx','my','btn','key','xp_crop'])
+        self.mouse_listener = mouse.Listener(on_click=self.on_click)
+        self.mouse_listener.start()
+        self.keyboard_listener = keyboard.Listener(on_press=self.on_press)
+        self.keyboard_listener.start()
+        self.stop_event.clear()
+        self.thread = threading.Thread(target=self.record_loop, daemon=True)
+        self.thread.start()
+        self.recording = True
+        self.record_button.config(text='Stop Recording')
 
-    # instantiate models
-    xp_model = XPRegressor().to(DEVICE)
-    xp_opt   = optim.Adam(xp_model.parameters(), lr=LR)
-    xp_loss  = nn.MSELoss()
-    if use_clf:
-        sc_model = SkillClassifier(len(skill_names)).to(DEVICE)
-        sc_opt   = optim.Adam(sc_model.parameters(), lr=LR)
-        sc_loss  = nn.CrossEntropyLoss()
-    if use_dd:
-        dd_model = DropDetector().to(DEVICE)
-        dd_opt   = optim.Adam(dd_model.parameters(), lr=LR)
-        dd_loss  = nn.BCELoss()
+    def stop_recording(self):
+        self.stop_event.set()
+        self.thread.join()
+        self.mouse_listener.stop()
+        self.keyboard_listener.stop()
+        self.csvf.close()
+        self.recording = False
+        self.record_button.config(text='Start Recording')
 
-    # training loops
-    start = time.time()
-    for e in range(1, EPOCHS+1):
-        mse, rmse = train_regressor(xp_model, tr_xp, xp_opt, xp_loss)
-        vmse, vrmse= train_regressor(xp_model, vl_xp, xp_opt, xp_loss)
-        print(f"{GREEN}[Regressor]{RESET} Epoch {e}/{EPOCHS} ➤ train RMSE={rmse:.3f}, val MSE={vmse:.3f}")
+    def on_click(self, x, y, button, pressed):
+        wins = gw.getWindowsWithTitle('Old School RuneScape')
+        if not pressed or not wins:
+            return
+        w = wins[0]
+        if w.left <= x <= w.left + w.width and w.top <= y <= w.top + w.height:
+            ts = datetime.now().isoformat()
+            self.click_queue.append((ts, x, y, str(button)))
+            self.click_count += 1
+            self.root.after(0, lambda: self.click_label.config(text=f"Clicks: {self.click_count}"))
 
-    if use_clf:
-        for e in range(1, EPOCHS+1):
-            ce, acc   = train_classifier(sc_model, tr_xp, sc_opt, sc_loss)
-            vce, vacc = train_classifier(sc_model, vl_xp, sc_opt, sc_loss)
-            print(f"{BLUE}[Classifier]{RESET} Epoch {e}/{EPOCHS} ➤ train Acc={acc*100:.1f}%, val Acc={vacc*100:.1f}%")
+    def on_press(self, key):
+        wins = gw.getWindowsWithTitle('Old School RuneScape')
+        active = gw.getActiveWindow()
+        if wins and active and 'Old School RuneScape' in active.title:
+            ts = datetime.now().isoformat()
+            self.key_queue.append((ts, str(key)))
+            self.key_count += 1
+            self.root.after(0, lambda: self.key_label.config(text=f"Keys: {self.key_count}"))
 
-    if use_dd:
-        for e in range(1, EPOCHS+1):
-            dl, da   = train_detector(dd_model, tr_dd, dd_opt, dd_loss)
-            vdl, vda = train_detector(dd_model, vl_dd, dd_opt, dd_loss)
-            print(f"{MAGENTA}[Detector]{RESET} Epoch {e}/{EPOCHS} ➤ train Acc={da*100:.1f}%, val Acc={vda*100:.1f}%")
+    def record_loop(self):
+        with mss() as sct:
+            while not self.stop_event.is_set():
+                ts = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+                wins = gw.getWindowsWithTitle('Old School RuneScape')
+                imgpath = ''
+                croppath = ''
+                if wins:
+                    w = wins[0]
+                    region = {'top': w.top, 'left': w.left, 'width': w.width, 'height': w.height}
+                    frame = sct.grab(region)
+                    imgpath = os.path.join(SCREENSHOT_DIR, f"{ts}.png")
+                    tools.to_png(frame.rgb, frame.size, output=imgpath)
+                    self.shot_count += 1
+                    self.root.after(0, lambda: self.shot_label.config(text=f"Screenshots: {self.shot_count}"))
+                    if self.popup_region:
+                        # Convert to PIL and crop
+                        pil_full = Image.frombytes('RGB', frame.size, frame.rgb)
+                        pr = self.popup_region
+                        crop = pil_full.crop((pr['left'], pr['top'], pr['left']+pr['width'], pr['top']+pr['height']))
+                        croppath = os.path.join(XP_CROP_DIR, f"{ts}.png")
+                        crop.save(croppath)
+                        self.crop_count += 1
+                        self.root.after(0, lambda: self.crop_label.config(text=f"XP Crops: {self.crop_count}"))
+                while self.click_queue:
+                    c_ts, mx, my, btn = self.click_queue.pop(0)
+                    self.writer.writerow([c_ts, imgpath, mx, my, btn, '', croppath])
+                while self.key_queue:
+                    k_ts, k = self.key_queue.pop(0)
+                    self.writer.writerow([k_ts, imgpath, '', '', '', k, croppath])
+                self.csvf.flush()
+                time.sleep(self.interval)
 
-    # save
-    os.makedirs("models", exist_ok=True)
-    torch.save(xp_model.state_dict(),  "models/xp_regressor.pth")
-    if use_clf: torch.save(sc_model.state_dict(),  "models/skill_classifier.pth")
-    if use_dd:  torch.save(dd_model.state_dict(),  "models/xp_detector.pth")
-
-    elapsed = time.time() - start
-    print(f"\n{CYAN}== Training complete in {elapsed/60:.1f} min =={RESET}")
+if __name__ == '__main__':
+    root = tk.Tk()
+    app = XPRecorder(root)
+    root.mainloop()
