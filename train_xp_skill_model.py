@@ -1,276 +1,361 @@
 #!/usr/bin/env python3
 import os
-import time
+import math
+import copy
 import pandas as pd
+import numpy as np
 from PIL import Image
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader, random_split
-
+from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
-from torchvision.transforms import Grayscale, ToTensor
-from collections import Counter
+from torchvision.models import resnet18, ResNet18_Weights
 
-# ─── ANSI COLORS ──────────────────────────────────────────────────────────────
-RED     = '\033[91m'
-GREEN   = '\033[92m'
-YELLOW  = '\033[93m'
-BLUE    = '\033[94m'
-MAGENTA = '\033[95m'
-CYAN    = '\033[96m'
-RESET   = '\033[0m'
+# Colored console output
+from colorama import Fore, Style, init
+init(autoreset=True)
+# Detailed metrics
+from sklearn.metrics import classification_report, confusion_matrix
 
-# ─── Hyperparameters ─────────────────────────────────────────────────────────
-LABEL_CSV    = "data/xp_labels.csv"
-CROP_DIR     = "data/xp_crops_labeled"
-BATCH_SIZE   = 32
-LR           = 1e-3
-WEIGHT_DECAY = 1e-4
-EPOCHS       = 100
-VAL_FRAC     = 0.2
-PATIENCE     = 2
-FACTOR       = 0.5
-DEVICE       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# ─── Paths & Constants ─────────────────────────────────────────────────
+CSV_PATH      = "data/xp_labels.csv"
+IMG_DIR       = "data/xp_crops_labeled"
+REGRESSOR_PTH = "models/xp_regressor.pth"
+CLASSIFIER_PTH= "models/skill_classifier.pth"
+COUNT_PTH     = "models/drop_count_regressor.pth"
+BATCH_SIZE    = 32
+NUM_EPOCHS    = 50
+PATIENCE      = 5
+LR            = 1e-4
+DEVICE        = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# ─── Augmentation & Validation Transforms ───────────────────────────────────
-train_transform = transforms.Compose([
+# ─── Skill Mapping ──────────────────────────────────────────────────────
+SKILLS = [
+    "None", "woodcutting", "mining", "fishing", "cooking", "firemaking",
+    "fletching", "thieving", "agility", "herblore", "crafting",
+    "smithing", "runecrafting", "slayer", "farming", "construction", "hunter"
+]
+SKILL2IDX   = {s:i for i,s in enumerate(SKILLS)}
+NUM_SKILLS  = len(SKILLS)
+
+# ─── Transforms ─────────────────────────────────────────────────────────
+train_tf = transforms.Compose([
     transforms.Resize((64,64)),
-    Grayscale(num_output_channels=1),
-    transforms.RandomHorizontalFlip(p=0.5),
-    transforms.RandomRotation(10),
-    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1),
-    transforms.RandomAffine(0, translate=(0.1,0.1)),
-    ToTensor(),
+    transforms.RandomAffine(10, translate=(0.05,0.05)),
+    transforms.ColorJitter(0.2,0.2),
+    transforms.Grayscale(1),
+    transforms.ToTensor(),
+    transforms.Normalize([0.5],[0.5]),
+])
+val_tf = transforms.Compose([
+    transforms.Resize((64,64)),
+    transforms.Grayscale(1),
+    transforms.ToTensor(),
+    transforms.Normalize([0.5],[0.5]),
 ])
 
-val_transform = transforms.Compose([
-    transforms.Resize((64,64)),
-    Grayscale(num_output_channels=1),
-    ToTensor(),
-])
-
-# ─── Dataset for XP & Skill ─────────────────────────────────────────────────
-class XPSD(Dataset):
-    def __init__(self, label_csv, crop_dir, transform=None):
-        df = pd.read_csv(label_csv)
-        df['drop']  = df['drop'].fillna('no').str.lower()
-        df = df[df['drop']=="yes"].reset_index(drop=True)
-        df['skill'] = df['skill'].fillna('').astype(str)
-        df = df[df['skill']!=''].reset_index(drop=True)
-        self.df = df
-        self.skill_to_idx = {s:i for i,s in enumerate(sorted(df['skill'].unique()))}
-        self.crop_dir = crop_dir
-        self.transform = transform
-
-    def __len__(self):
-        return len(self.df)
-
-    def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-        img = Image.open(os.path.join(self.crop_dir, row['filename'])).convert("RGB")
-        img = self.transform(img) if self.transform else ToTensor()(img)
-        xp = torch.tensor(float(row['value'] or 0.0), dtype=torch.float32)
-        skill_idx = self.skill_to_idx[row['skill']]
-        return img, xp, skill_idx, 1  # drop_label always 1 here
-
-# ─── Dataset for Drop Detection ───────────────────────────────────────────────
-class DropDataset(Dataset):
-    def __init__(self, label_csv, crop_dir, transform=None):
-        df = pd.read_csv(label_csv)
-        df['drop'] = df['drop'].fillna('no').str.lower()
+# ─── Datasets ───────────────────────────────────────────────────────────
+class XPMultiDataset(Dataset):
+    def __init__(self, df, transform, max_drops):
+        df = df.copy()
+        df['value_list'] = df['value'].fillna("").astype(str).str.split(';').map(
+            lambda lst: [float(v) for v in lst if v.strip()]
+        )
+        df['drop_count'] = df['value_list'].map(len)
         self.df = df.reset_index(drop=True)
-        self.crop_dir = crop_dir
         self.transform = transform
+        self.max_drops = max_drops
+    def __len__(self): return len(self.df)
+    def __getitem__(self, i):
+        row = self.df.iloc[i]
+        img = Image.open(os.path.join(IMG_DIR, row.filename)).convert('RGB')
+        x = self.transform(img)
+        y = np.zeros(self.max_drops, dtype=np.float32)
+        for j,v in enumerate(row.value_list): y[j] = v
+        return x, torch.tensor(y)
+
+class SkillMultiDataset(Dataset):
+    """
+    Per-drop skill labels: repeats skill index for each drop, pads zeros for missing.
+    Only rows with drop_count > 0 are kept, and skill_idx is guaranteed integer.
+    """
+    def __init__(self, df, transform, max_drops):
+        df = df.copy()
+        df['value_list'] = (
+            df['value']
+              .fillna("")
+              .astype(str)
+              .str.split(';')
+              .map(lambda lst: [float(v) for v in lst if v.strip()])
+        )
+        df['drop_count'] = df['value_list'].map(len).astype(int)
+
+        # filter to only examples that actually have drops
+        df = df[df['drop_count'] > 0].reset_index(drop=True)
+
+        # map skill names to indices, drop any rows where mapping failed
+        df['skill_idx'] = df['skill'].map(SKILL2IDX)
+        df = df[df['skill_idx'].notnull()].copy()
+        df['skill_idx'] = df['skill_idx'].astype(int)
+
+        self.df = df.reset_index(drop=True)
+        self.transform = transform
+        self.max_drops = max_drops
 
     def __len__(self):
         return len(self.df)
 
-    def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-        img = Image.open(os.path.join(self.crop_dir, row['filename'])).convert("RGB")
-        img = self.transform(img) if self.transform else ToTensor()(img)
-        drop_lbl = 1 if row['drop']=="yes" else 0
-        return img, drop_lbl
+    def __getitem__(self, i):
+        row = self.df.iloc[i]
+        img = Image.open(os.path.join(IMG_DIR, row.filename)).convert('RGB')
+        x = self.transform(img)
 
-# ─── Models ──────────────────────────────────────────────────────────────────
-class XPRegressor(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(1,16,3,padding=1), nn.ReLU(), nn.MaxPool2d(2),
-            nn.Conv2d(16,32,3,padding=1), nn.ReLU(), nn.MaxPool2d(2),
-            nn.Flatten(),
-            nn.Linear(32*16*16,128), nn.ReLU(), nn.Dropout(0.5),
-            nn.Linear(128,1)
+        # build a length-max_drops int array, repeating skill_idx for each drop
+        y = np.zeros(self.max_drops, dtype=np.int64)
+        for j in range(row.drop_count):
+            y[j] = row.skill_idx
+        return x, torch.tensor(y)
+
+class DropCountDataset(Dataset):
+    def __init__(self, df, transform):
+        df = df.copy()
+        df['value_list'] = df['value'].fillna("").astype(str).str.split(';').map(
+            lambda lst: [float(v) for v in lst if v.strip()]
         )
-    def forward(self,x): return self.net(x).squeeze(1)
+        df['drop_count'] = df['value_list'].map(len)
+        self.df = df.reset_index(drop=True)
+        self.transform = transform
+    def __len__(self): return len(self.df)
+    def __getitem__(self, i):
+        row = self.df.iloc[i]
+        img = Image.open(os.path.join(IMG_DIR, row.filename)).convert('RGB')
+        x = self.transform(img)
+        return x, torch.tensor(row.drop_count, dtype=torch.float32)
 
-class SkillClassifier(nn.Module):
-    def __init__(self, n_skills):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(1,16,3,padding=1), nn.ReLU(), nn.MaxPool2d(2),
-            nn.Conv2d(16,32,3,padding=1), nn.ReLU(), nn.MaxPool2d(2),
-            nn.Flatten(),
-            nn.Linear(32*16*16,128), nn.ReLU(), nn.Dropout(0.5),
-            nn.Linear(128,n_skills)
-        )
-    def forward(self,x): return self.net(x)
+# ─── Model Builders ───────────────────────────────────────────────────────
+def make_regressor(output_dim):
+    m = resnet18(weights=ResNet18_Weights.DEFAULT)
+    m.conv1 = nn.Conv2d(1,64,7,2,3,bias=False)
+    m.fc = nn.Sequential(
+        nn.Linear(m.fc.in_features,128),
+        nn.ReLU(), nn.Dropout(0.5),
+        nn.Linear(128,output_dim)
+    )
+    return m.to(DEVICE)
 
-class DropDetector(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(1,16,3,padding=1), nn.ReLU(), nn.MaxPool2d(2),
-            nn.Conv2d(16,32,3,padding=1), nn.ReLU(), nn.MaxPool2d(2),
-            nn.Flatten(),
-            nn.Linear(32*16*16,64), nn.ReLU(), nn.Dropout(0.5),
-            nn.Linear(64,1), nn.Sigmoid()
-        )
-    def forward(self,x): return self.net(x).squeeze(1)
+def make_multi_classifier(max_drops):
+    m = resnet18(weights=ResNet18_Weights.DEFAULT)
+    m.conv1 = nn.Conv2d(1,64,7,2,3,bias=False)
+    m.fc = nn.Linear(m.fc.in_features, max_drops * NUM_SKILLS)
+    return m.to(DEVICE)
 
-# ─── Training Routines ───────────────────────────────────────────────────────
-def train_regressor(model, loader, opt, loss_fn):
+# ─── Training & Eval ──────────────────────────────────────────────────────
+def train_one(model, loader, criterion, optimizer, is_class=False, max_drops=None):
     model.train()
-    total_sq, count = 0., 0
-    for imgs, xp_true, *_ in loader:
-        imgs, xp_true = imgs.to(DEVICE), xp_true.to(DEVICE)
-        preds = model(imgs)
-        loss  = loss_fn(preds, xp_true)
-        opt.zero_grad(); loss.backward(); opt.step()
-        total_sq += ((preds-xp_true)**2).sum().item()
-        count    += xp_true.size(0)
-    return total_sq/count, (total_sq/count)**0.5
+    total_loss=0.0
+    for x,y in loader:
+        x = x.to(DEVICE); y = y.to(DEVICE)
+        optimizer.zero_grad()
+        out = model(x)
+        if is_class:
+            B = x.size(0)
+            out = out.view(B, max_drops, NUM_SKILLS)
+            loss = sum(criterion(out[:,d,:], y[:,d]) for d in range(max_drops))
+        else:
+            out = out.squeeze(-1)
+            loss = criterion(out, y)
+        loss.backward(); optimizer.step()
+        total_loss += loss.item() * x.size(0)
+    return total_loss / len(loader.dataset)
 
-def train_classifier(model, loader, opt, loss_fn):
-    model.train()
-    total_loss, correct, total = 0.,0,0
-    for imgs, _, skill_true, _ in loader:
-        imgs, skill_true = imgs.to(DEVICE), skill_true.to(DEVICE)
-        logits = model(imgs)
-        loss   = loss_fn(logits, skill_true)
-        opt.zero_grad(); loss.backward(); opt.step()
-        total_loss += loss.item()*imgs.size(0)
-        preds = logits.argmax(1)
-        correct += (preds==skill_true).sum().item()
-        total   += imgs.size(0)
-    return total_loss/total, correct/total if total>0 else 0.0
+def eval_one(model, loader, criterion, is_class=False, max_drops=None):
+    model.eval()
+    total_loss=0.0
+    correct = [0]*max_drops if is_class else None
+    total = 0
+    with torch.no_grad():
+        for x,y in loader:
+            B = x.size(0)
+            x = x.to(DEVICE); y = y.to(DEVICE)
+            out = model(x)
+            if is_class:
+                out = out.view(B, max_drops, NUM_SKILLS)
+                loss = sum(criterion(out[:,d,:], y[:,d]) for d in range(max_drops))
+                for d in range(max_drops):
+                    preds = out[:,d,:].argmax(1)
+                    correct[d] += (preds == y[:,d]).sum().item()
+            else:
+                out = out.squeeze(-1)
+                loss = criterion(out, y)
+            total_loss += loss.item() * B
+            total += B
+    avg_loss = total_loss / total
+    if is_class:
+        return avg_loss, [c/total for c in correct]
+    return avg_loss
 
-def train_detector(model, loader, opt, loss_fn):
-    model.train()
-    total_loss, correct, total = 0.,0,0
-    for imgs, drop_true in loader:
-        imgs, drop_true = imgs.to(DEVICE), drop_true.to(DEVICE).float()
-        preds = model(imgs)
-        loss  = loss_fn(preds, drop_true)
-        opt.zero_grad(); loss.backward(); opt.step()
-        total_loss += loss.item()*imgs.size(0)
-        correct += ((preds>0.5).long()==drop_true.long()).sum().item()
-        total   += imgs.size(0)
-    return total_loss/total, correct/total if total>0 else 0.0
+def run_training(name, model, tr_loader, va_loader, crit, opt, sched, is_class=False, max_drops=None):
+    print(Fore.CYAN + f"\n=== {name} ===" + Style.RESET_ALL)
+    best_state  = copy.deepcopy(model.state_dict())
+    best_metric = -math.inf if is_class else math.inf
+    no_imp = 0
+    for epoch in range(1, NUM_EPOCHS+1):
+        tl = train_one(model, tr_loader, crit, opt, is_class, max_drops)
+        if is_class:
+            vl, accs = eval_one(model, va_loader, crit, True, max_drops)
+            metric = sum(accs)/len(accs)
+        else:
+            vl = eval_one(model, va_loader, crit, False)
+            metric = vl
+        improved = (metric > best_metric) if is_class else (vl < best_metric)
+        status = (Fore.GREEN+"improved" if improved else Fore.YELLOW+"no change")+Style.RESET_ALL
+        if improved:
+            best_metric = metric; best_state = copy.deepcopy(model.state_dict()); no_imp = 0
+        else:
+            no_imp += 1
+        if is_class:
+            print(f"Epoch {epoch} [{status}]: val_loss={vl:.4f}, mean_acc={np.mean(accs)*100:5.1f}%")
+            sched.step(np.mean(accs))
+        else:
+            rmse = math.sqrt(tl)
+            vrmse = math.sqrt(vl)
+            print(f"Epoch {epoch} [{status}]: MSE={tl:.4f}, RMSE={rmse:.4f} | val MSE={vl:.4f}, val RMSE={vrmse:.4f}")
+            sched.step(vl)
+        if no_imp >= PATIENCE:
+            print(Fore.MAGENTA+"→ Early stopping"+Style.RESET_ALL)
+            break
+    model.load_state_dict(best_state)
+    print(Fore.CYAN + f"=== Done {name} ===\n" + Style.RESET_ALL)
+    return model
 
-# ─── Main Pipeline ──────────────────────────────────────────────────────────
-if __name__=="__main__":
-    start_time = time.time()
-    print(f"{CYAN}== Starting Training Pipeline =={RESET}\n")
+# ─── Main ──────────────────────────────────────────────────────────────────
+if __name__=='__main__':
+    # ─── Load & parse labels CSV ────────────────────────────────────────────
+    df = pd.read_csv(CSV_PATH)
+    df['value_list'] = df['value'].fillna("").astype(str).str.split(';').map(
+        lambda lst: [float(v) for v in lst if v.strip()])
+    df['drop_count'] = df['value_list'].map(len)
+    max_drops = int(df['drop_count'].max())
 
-    # — XP+Skill dataset & split —
-    full_xp_ds = XPSD(LABEL_CSV, CROP_DIR, transform=val_transform)
-    n_val = int(len(full_xp_ds)*VAL_FRAC)
-    n_trn = len(full_xp_ds) - n_val
-    xp_tr_ds, xp_vl_ds = random_split(full_xp_ds, [n_trn, n_val])
-    tr_xp = DataLoader(xp_tr_ds, batch_size=BATCH_SIZE, shuffle=True)
-    vl_xp = DataLoader(xp_vl_ds, batch_size=BATCH_SIZE, shuffle=False)
+    # ─── Dataset Summary ──────────────────────────────────────────────────────
+    skills_present = sorted(df['skill'].dropna().unique())
+    print(Fore.YELLOW + "Dataset Summary:" + Style.RESET_ALL)
+    print(f" - Skills present ({len(skills_present)}): {', '.join(skills_present)}")
+    print(f" - Maximum XP drops in any one crop: {max_drops}\n")
 
-    # — Drop detector dataset & split —
-    full_dd = DropDataset(LABEL_CSV, CROP_DIR, transform=val_transform)
-    n_val2 = int(len(full_dd)*VAL_FRAC)
-    n_trn2 = len(full_dd) - n_val2
-    dd_tr_ds, dd_vl_ds = random_split(full_dd, [n_trn2, n_val2])
-    tr_dd = DataLoader(dd_tr_ds, batch_size=BATCH_SIZE, shuffle=True)
-    vl_dd = DataLoader(dd_vl_ds, batch_size=BATCH_SIZE, shuffle=False)
+    # ─── Input Data Details ───────────────────────────────────────────────────
+    print(Fore.YELLOW + "Input Data Details:" + Style.RESET_ALL)
+    print(f" - Total samples: {len(df)}")
+    idx = np.arange(len(df));
+    np.random.shuffle(idx)
+    split = int(0.8 * len(df))
+    df_tr, df_va = df.iloc[idx[:split]], df.iloc[idx[split:]]
+    for name, split_df in [("Train", df_tr), ("Val", df_va)]:
+        dc = split_df['drop_count'].value_counts().sort_index()
+        print(f" - {name} drop-count distribution:")
+        for cnt, num in dc.items():
+            print(f"    {cnt}: {num}")
+        all_xp = [v for lst in split_df['value_list'] for v in lst]
+        if all_xp:
+            print(
+                f" - {name} XP values summary: mean={np.mean(all_xp):.1f}, std={np.std(all_xp):.1f}, min={np.min(all_xp):.1f}, max={np.max(all_xp):.1f}")
 
-    # ─── Diagnostics ─────────────────────────────────────────────────────
-    skill_names = list(full_xp_ds.skill_to_idx.keys())
-    print(f"{YELLOW}XP dataset samples:{RESET} train={len(xp_tr_ds)}  val={len(xp_vl_ds)}")
-    print(f"{YELLOW}Drop dataset samples:{RESET} train={len(dd_tr_ds)}  val={len(dd_vl_ds)}")
-    print(f"{YELLOW}Skill classes:{RESET} {skill_names}")
-    use_clf = len(skill_names)>=2
-    if not use_clf:
-        print(f"{RED}⚠️ Skipping skill classifier (need ≥2 skills).{RESET}")
-    drop_labels = set(full_dd.df['drop'].tolist())
-    use_dd = 'yes' in drop_labels and 'no' in drop_labels
-    if not use_dd:
-        print(f"{RED}⚠️ Skipping drop detector (need yes & no).{RESET}")
-    print()
+    # DataLoaders
+    xp_tr = DataLoader(XPMultiDataset(df_tr, train_tf, max_drops), batch_size=BATCH_SIZE, shuffle=True)
+    xp_va = DataLoader(XPMultiDataset(df_va, val_tf,   max_drops), batch_size=BATCH_SIZE)
+    sk_tr = DataLoader(SkillMultiDataset(df_tr, train_tf, max_drops), batch_size=BATCH_SIZE, shuffle=True)
+    sk_va = DataLoader(SkillMultiDataset(df_va, val_tf,   max_drops), batch_size=BATCH_SIZE)
+    dc_tr = DataLoader(DropCountDataset(df_tr, train_tf), batch_size=BATCH_SIZE, shuffle=True)
+    dc_va = DataLoader(DropCountDataset(df_va, val_tf), batch_size=BATCH_SIZE)
 
-    # ─── Instantiate & train ─────────────────────────────────────────────
-    xp_model = XPRegressor().to(DEVICE)
-    xp_opt   = optim.Adam(xp_model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-    xp_sched = optim.lr_scheduler.ReduceLROnPlateau(xp_opt, mode='min',
-                  factor=FACTOR, patience=PATIENCE, verbose=True)
-    xp_loss  = nn.MSELoss()
+    # Informative overview before training
+    print(Fore.YELLOW + "\nModels and Data Overview:" + Style.RESET_ALL)
+    print(f" - XP Multi-Drop Regressor: train samples={len(xp_tr.dataset)}, val samples={len(xp_va.dataset)}, input shape=1×64×64, output slots={max_drops}")
+    print(f" - Skill Multi-Classifier: train samples={len(sk_tr.dataset)}, val samples={len(sk_va.dataset)}, slots={max_drops}, classes={NUM_SKILLS}")
+    print(f" - Drop-Count Regressor: train samples={len(dc_tr.dataset)}, val samples={len(dc_va.dataset)}, input shape=1×64×64, output scalar")
+    print(Fore.CYAN + "Metrics Legend: MSE/RMSE for regressors; val_loss/mean_acc for classifier; per-slot RMSE & supports; detailed confusion matrices." + Style.RESET_ALL)
 
-    if use_clf:
-        sc_model = SkillClassifier(len(skill_names)).to(DEVICE)
-        sc_opt   = optim.Adam(sc_model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-        sc_sched = optim.lr_scheduler.ReduceLROnPlateau(sc_opt, mode='max',
-                      factor=FACTOR, patience=PATIENCE, verbose=True)
-        sc_loss  = nn.CrossEntropyLoss()
+    # Train XP Multi-Drop Regressor
+    net_xp = make_regressor(max_drops)
+    opt_xp = optim.Adam(net_xp.parameters(), lr=LR)
+    sched_xp = optim.lr_scheduler.ReduceLROnPlateau(opt_xp, 'min', 0.5, 2)
+    crit_xp = nn.MSELoss()
+    net_xp = run_training('XP Multi-Drop Regressor', net_xp, xp_tr, xp_va, crit_xp, opt_xp, sched_xp, False)
 
-    if use_dd:
-        dd_model = DropDetector().to(DEVICE)
-        dd_opt   = optim.Adam(dd_model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-        dd_sched = optim.lr_scheduler.ReduceLROnPlateau(dd_opt, mode='max',
-                      factor=FACTOR, patience=PATIENCE, verbose=True)
-        dd_loss  = nn.BCELoss()
+    # per-slot RMSE & support counts
+    print(Fore.MAGENTA + "\nXP Regressor Per-Drop RMSE & Support:" + Style.RESET_ALL)
+    errors = np.zeros(max_drops)
+    counts = np.zeros(max_drops)
+    net_xp.eval()
+    with torch.no_grad():
+        for x,y in xp_va:
+            preds = net_xp(x.to(DEVICE)).cpu().numpy()
+            truths = y.numpy()
+            for i in range(max_drops):
+                errors[i] += ((preds[:,i] - truths[:,i])**2).sum()
+                counts[i] += truths.shape[0]
+    overall_mse = errors.sum() / counts.sum()
+    overall_rmse = math.sqrt(overall_mse)
+    for i in range(max_drops):
+        mse_i = errors[i]/counts[i]
+        rmse_i = math.sqrt(mse_i)
+        print(f"  Slot {i+1}: support={int(counts[i])}, RMSE={rmse_i:.2f}")
+    print(f"  → Overall across all slots: RMSE={overall_rmse:.2f}")
 
-    # ─── Training loops (same as before) ──────────────────────────────────
-    print(f"{GREEN}-- Training XP Regressor --{RESET}")
-    for epoch in range(1, EPOCHS+1):
-        full_xp_ds.transform = train_transform
-        mse_tr, rmse_tr = train_regressor(xp_model, tr_xp, xp_opt, xp_loss)
-        full_xp_ds.transform = val_transform
-        mse_vl, _       = train_regressor(xp_model, vl_xp, xp_opt, xp_loss)
-        xp_sched.step(mse_vl)
-        lr = xp_opt.param_groups[0]['lr']
-        print(f"{GREEN}Epoch {epoch}/{EPOCHS}{RESET}"
-              f" train RMSE={rmse_tr:.3f}, val MSE={mse_vl:.3f}"
-              f" | {CYAN}LR={lr:.1e}{RESET}")
+    # Train Skill Multi-Classifier
+    net_sk = make_multi_classifier(max_drops)
+    opt_sk = optim.Adam(net_sk.parameters(), lr=LR)
+    sched_sk = optim.lr_scheduler.ReduceLROnPlateau(opt_sk, 'max', 0.5, 2)
+    crit_sk = nn.CrossEntropyLoss()
+    net_sk = run_training('Skill Multi-Classifier', net_sk, sk_tr, sk_va, crit_sk, opt_sk, sched_sk, True, max_drops)
+    torch.save(net_sk.state_dict(), CLASSIFIER_PTH)
 
-    if use_clf:
-        print(f"\n{BLUE}-- Training Skill Classifier --{RESET}")
-        for epoch in range(1, EPOCHS+1):
-            full_xp_ds.transform = train_transform
-            ce_tr, acc_tr = train_classifier(sc_model, tr_xp, sc_opt, sc_loss)
-            full_xp_ds.transform = val_transform
-            ce_vl, acc_vl = train_classifier(sc_model, vl_xp, sc_opt, sc_loss)
-            sc_sched.step(acc_vl)
-            lr = sc_opt.param_groups[0]['lr']
-            print(f"{BLUE}Epoch {epoch}/{EPOCHS}{RESET}"
-                  f" train Acc={acc_tr*100:.1f}%, val Acc={acc_vl*100:.1f}%"
-                  f" | {CYAN}LR={lr:.1e}{RESET}")
+    # Detailed skill report
+    print(Fore.MAGENTA + "\nSkill Classifier Detailed Report:" + Style.RESET_ALL)
+    y_true, y_pred = [], []
+    net_sk.eval()
+    with torch.no_grad():
+        for x,y in sk_va:
+            B = x.size(0)
+            out = net_sk(x.to(DEVICE)).view(B, max_drops, NUM_SKILLS)
+            p = out.argmax(2).cpu().numpy()
+            y_pred.extend(p.flatten())
+            y_true.extend(y.numpy().flatten())
+    labels = sorted(set(y_true))
+    names  = [SKILLS[i] for i in labels]
+    print(classification_report(y_true, y_pred, labels=labels, target_names=names))
+    cm_norm = confusion_matrix(y_true, y_pred, labels=labels, normalize='true')
+    cm_raw  = confusion_matrix(y_true, y_pred, labels=labels)
+    print("Normalized Confusion Matrix (rows=true):"); print(np.round(cm_norm,2))
+    print("Raw Confusion Matrix (counts):");       print(cm_raw)
 
-    if use_dd:
-        print(f"\n{MAGENTA}-- Training Drop Detector --{RESET}")
-        for epoch in range(1, EPOCHS+1):
-            full_dd.transform = train_transform
-            ld_tr, la_tr = train_detector(dd_model, tr_dd, dd_opt, dd_loss)
-            full_dd.transform = val_transform
-            ld_vl, la_vl = train_detector(dd_model, vl_dd, dd_opt, dd_loss)
-            dd_sched.step(la_vl)
-            lr = dd_opt.param_groups[0]['lr']
-            print(f"{MAGENTA}Epoch {epoch}/{EPOCHS}{RESET}"
-                  f" train Acc={la_tr*100:.1f}%, val Acc={la_vl*100:.1f}%"
-                  f" | {CYAN}LR={lr:.1e}{RESET}")
+    # Train Drop-Count Regressor
+    net_dc = make_regressor(1)
+    opt_dc = optim.Adam(net_dc.parameters(), lr=LR)
+    sched_dc = optim.lr_scheduler.ReduceLROnPlateau(opt_dc, 'min', 0.5, 2)
+    crit_dc = nn.MSELoss()
+    net_dc = run_training('Drop-Count Regressor', net_dc, dc_tr, dc_va, crit_dc, opt_dc, sched_dc, False)
 
-    # ─── Save models & done ────────────────────────────────────────────────
-    os.makedirs("models", exist_ok=True)
-    torch.save(xp_model.state_dict(),  "models/xp_regressor.pth")
-    if use_clf: torch.save(sc_model.state_dict(),  "models/skill_classifier.pth")
-    if use_dd:  torch.save(dd_model.state_dict(),  "models/xp_detector.pth")
+    # Drop-count as classification report
+    print(Fore.MAGENTA + "\nDrop-Count Classification Report:" + Style.RESET_ALL)
+    y_true, y_pred = [], []
+    net_dc.eval()
+    with torch.no_grad():
+        for x,y in dc_va:
+            trues = y.numpy().astype(int)
+            preds = np.round(net_dc(x.to(DEVICE)).cpu().numpy().flatten()).astype(int)
+            y_true.extend(trues); y_pred.extend(preds)
+    labels = sorted(set(y_true))
+    print(classification_report(y_true, y_pred, labels=labels, target_names=[str(l) for l in labels]))
+    cm_norm = confusion_matrix(y_true, y_pred, labels=labels, normalize='true')
+    cm_raw  = confusion_matrix(y_true, y_pred, labels=labels)
+    print("Normalized Drop-Count Confusion Matrix:"); print(np.round(cm_norm,2))
+    print("Raw Drop-Count Confusion Matrix:");       print(cm_raw)
 
-    elapsed = (time.time() - start_time) / 60
-    print(f"\n{CYAN}== Done in {elapsed:.1f} min =={RESET}")
+    # save
+    torch.save(net_xp.state_dict(), REGRESSOR_PTH)
+    torch.save(net_sk.state_dict(), CLASSIFIER_PTH)
+    torch.save(net_dc.state_dict(), COUNT_PTH)
+    print(Fore.CYAN + "\nFinished training and saved models with detailed metrics." + Style.RESET_ALL)
