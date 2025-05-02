@@ -189,6 +189,7 @@ class XPLabeler:
         # Reset pan/zoom
         self.zoom, self.origin_x, self.origin_y = 1.0, 0, 0
 
+        # Pick next file (random or sequential)
         if self.random_order.get():
             self.current_index = random.randint(0, len(self.files) - 1)
 
@@ -197,44 +198,50 @@ class XPLabeler:
         self.current_img = img
         self.count_label.config(text=f"Remaining: {len(self.files)}")
 
+        # YOLO inference
         results = self.yolo_model.predict(img, verbose=False)[0]
         xyxy = results.boxes.xyxy.cpu().numpy()
         confs = results.boxes.conf.cpu().numpy()
+        classes = results.boxes.cls.cpu().numpy().astype(int)
 
+        # Clear old boxes
         self.current_boxes.clear()
         self.skill_boxes.clear()
 
-        for (x0, y0, x1, y1), c in zip(xyxy, confs):
-            self.current_boxes.append(((x0, y0, x1, y1), c * 100))
-            ix1 = x0 - 2.5;
-            ix0 = ix1 - 25.5
-            yc = (y0 + y1 + 3) / 2
-            iy0 = yc - 11.75;
-            iy1 = yc + 11.75
-            self.skill_boxes.append((ix0, iy0, ix1, iy1))
+        # Separate drops vs skills
+        for (x0, y0, x1, y1), conf, cls in zip(xyxy, confs, classes):
+            if cls == 0:
+                # true drop
+                self.current_boxes.append(((x0, y0, x1, y1), conf * 100))
+            else:
+                # skill icon
+                self.skill_boxes.append((x0, y0, x1, y1))
 
-        # Autofill drop count only
+        # *** NEW: sort drops top-to-bottom by y0 ***
+        self.current_boxes.sort(key=lambda item: item[0][1])
+
+        # Autofill drop count only from real drops
         cnt = len(self.current_boxes)
-        self.count_spin.delete(0, 'end');
+        self.count_spin.delete(0, 'end')
         self.count_spin.insert(0, str(cnt))
-        self.last_count = cnt;
+        self.last_count = cnt
         self._on_count_changed()
 
-        # Compute CRNN preds + confidences
+        # Compute CRNN preds + confidences for each drop (now in sorted order)
         self._compute_crnn_preds()
 
-        # --- NEW: auto-fill XP if all confidences >= 80% ---
-        if self.xp_confs and all(conf >= 80.0 for conf in self.xp_confs):
+        # Auto-fill XP if confidences are high
+        if self.xp_confs and all(c >= 80.0 for c in self.xp_confs):
             pred_values = ";".join(self.xp_preds)
             self.value_entry.delete(0, 'end')
             self.value_entry.insert(0, pred_values)
             self.last_value = pred_values
-        # else: leave whatever got loaded by _on_count_changed() / defaults
 
-        # Redraw and show preds
+        # Redraw canvas & update prediction pane
         self._draw_image()
         self.load_pred_frame()
 
+        # Focus the XP entry
         self.value_entry.focus_set()
         self.value_entry.selection_range(0, 'end')
 
@@ -244,33 +251,35 @@ class XPLabeler:
         if not self.current_img or not self.current_boxes:
             return
 
-        BLANK_IDX = 10  # adjust if your model used a different blank
+        BLANK_IDX = 10  # your CTC “blank” token index
 
         for box, _ in self.current_boxes:
+            # crop & preprocess
             crop = self.current_img.crop(tuple(map(int, box)))
-            t = self.ctc_preprocess(crop).unsqueeze(0)  # (1,1,H,W) or (1,C,H,W)
+            t = self.ctc_preprocess(crop).unsqueeze(0)  # (1,1,H,W)
 
             with torch.no_grad():
                 logp = self.ctc_model(t)
-                # Auto-detect layout
+                # normalize to (T, C)
                 if logp.dim() == 3 and logp.shape[0] == 1:
-                    # (B=1, T, C)
-                    probs = logp.squeeze(0).softmax(dim=1)  # → (T, C)
+                    probs = logp.squeeze(0).softmax(dim=1)  # (T, C)
                 else:
-                    # assume (T, B, C)
-                    probs = logp.permute(1, 0, 2)[0].softmax(dim=1)  # → (T, C)
+                    probs = logp.permute(1, 0, 2)[0].softmax(dim=1)
 
                 pred = probs.argmax(dim=1)  # (T,)
 
-            # collapse repeats + remove blanks
-            seq, prev, confs = [], None, []
-            for tstep, p in enumerate(pred):
+            # --- collapse repeats + remove blanks ---
+            seq = []
+            confs = []
+            prev = BLANK_IDX
+            for timestep, p in enumerate(pred):
                 p = int(p.item())
                 if p != prev and p != BLANK_IDX:
                     seq.append(p)
-                    confs.append(probs[tstep, p].item())
+                    confs.append(probs[timestep, p].item())
                 prev = p
 
+            # build string & average confidence
             xp_str = ''.join(str(d) for d in seq)
             avg_conf = (sum(confs) / len(confs) * 100) if confs else 0.0
 
