@@ -8,16 +8,29 @@ EXTS = ['.json', '.txt', '.png']
 def check_label_file(json_path):
     """
     Returns (parse_error, content_errors) tuple:
-    - parse_error: a string if JSON failed to load, else None
-    - content_errors: list of mismatch messages
+    - parse_error: a string if JSON failed to load or is empty, else None
+    - content_errors: list of mismatch or missing‐file messages
     """
-    base, _ = os.path.splitext(json_path)
-    txt_path = base + ".txt"
-    errors = []
+    base, _   = os.path.splitext(json_path)
+    txt_path  = base + ".txt"
+    png_path  = base + ".png"
+    errors    = []
 
-    # 1) Load & validate JSON
+    # 0) Check for matching PNG
+    if not os.path.isfile(png_path):
+        errors.append("missing matching .png file")
+
+    # 1) Check JSON is non‐empty
     try:
-        with open(json_path, 'r') as f:
+        size = os.path.getsize(json_path)
+        if size == 0:
+            return (f"empty JSON file", [])
+    except OSError as e:
+        return (f"cannot access JSON file: {e}", [])
+
+    # 2) Load & validate JSON
+    try:
+        with open(json_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
     except json.JSONDecodeError as e:
         return (f"JSON parse error: {e}", [])
@@ -44,12 +57,12 @@ def check_label_file(json_path):
         if skill_boxes != drop_ct:
             errors.append(f"JSON boxes class>0: {skill_boxes} ≠ drop_count: {drop_ct}")
 
-    # 2) TXT match & counts
+    # 3) TXT match & counts
     if not os.path.isfile(txt_path):
         errors.append("missing matching .txt file")
     else:
         txt_drop = txt_skill = 0
-        with open(txt_path, 'r') as f:
+        with open(txt_path, 'r', encoding='utf-8') as f:
             for line_no, line in enumerate(f, 1):
                 parts = line.strip().split()
                 if not parts:
@@ -124,7 +137,7 @@ def main(folder):
 
     # Reporting
     if parse_failures:
-        print("\nJSON PARSE ERRORS:")
+        print("\nJSON PARSE/EMPTY ERRORS:")
         for fn, msg in parse_failures:
             print(f"  • {fn}: {msg}")
 

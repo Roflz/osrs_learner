@@ -46,6 +46,7 @@ SKILLS = [
 ]
 
 
+# noinspection PyPackageRequirements
 class XPLabeler:
     def __init__(self, root):
         self.root = root
@@ -189,79 +190,107 @@ class XPLabeler:
             self.count_label.config(text="✅ All images processed!")
             return
 
-        # Reset pan/zoom
+        # --- Reset pan/zoom ---
         self.zoom, self.origin_x, self.origin_y = 1.0, 0, 0
 
-        # Pick next file (random or sequential)
+        # --- Pick next file ---
         if self.random_order.get():
             self.current_index = random.randint(0, len(self.files) - 1)
-
         fn = self.files[self.current_index]
         img = Image.open(os.path.join(CROP_DIR, fn)).convert('RGB')
         self.current_img = img
         self.count_label.config(text=f"Remaining: {len(self.files)}")
 
-        # YOLO inference
+        # --- YOLO inference ---
         results = self.yolo_model.predict(img, verbose=False)[0]
-        xyxy = results.boxes.xyxy.cpu().numpy()
-        confs = results.boxes.conf.cpu().numpy()
+        xyxy    = results.boxes.xyxy.cpu().numpy()
+        confs   = results.boxes.conf.cpu().numpy()
         classes = results.boxes.cls.cpu().numpy().astype(int)
 
-        # Clear old
+        # --- Build drop boxes & raw skill list ---
         self.current_boxes.clear()
-        self.pred_skill_boxes = []  # raw YOLO skill detections
-        # build drop‐boxes
+        raw_skills = []
         for (x0, y0, x1, y1), conf, cls in zip(xyxy, confs, classes):
             if cls == 0:
-                # true drop
                 self.current_boxes.append(((x0, y0, x1, y1), conf * 100))
             else:
-                # only collect raw skill preds here
-                self.pred_skill_boxes.append((x0, y0, x1, y1))
+                yc = (y0 + y1) / 2.0
+                raw_skills.append({
+                    'cls': cls,
+                    'conf': float(conf),
+                    'y': yc,
+                    'xyxy': (x0, y0, x1, y1)
+                })
 
-        # **DEBUG OUTPUT**
-        print(f"[DEBUG] Detected {len(self.current_boxes)} drop box(es):")
-        for i, ((x0, y0, x1, y1), conf) in enumerate(self.current_boxes, 1):
-            print(f"  Drop {i}: ({x0:.1f},{y0:.1f},{x1:.1f},{y1:.1f}), conf={conf:.1f}%")
-        print(f"[DEBUG] Detected {len(self.pred_skill_boxes)} raw skill box(es):")
-        for i, (x0, y0, x1, y1) in enumerate(self.pred_skill_boxes, 1):
-            print(f"  SkillBox {i}: ({x0:.1f},{y0:.1f},{x1:.1f},{y1:.1f})")
+        # --- Sort drops & skills top→bottom ---
+        self.current_boxes.sort(key=lambda t: t[0][1])
+        raw_skills.sort(key=lambda r: r['y'])
 
-        # Sort drops top-to-bottom
-        self.current_boxes.sort(key=lambda item: item[0][1])
+        # --- Pair drops ↔ skills by minimal vertical distance ---
+        drop_centers = [((y0 + y1) / 2.0) for ((x0, y0, x1, y1), _) in self.current_boxes]
+        pairs = []
+        for i, dy in enumerate(drop_centers):
+            for j, sk in enumerate(raw_skills):
+                pairs.append((abs(dy - sk['y']), i, j))
+        pairs.sort(key=lambda x: x[0])
 
-        # Now build one hard-coded skill box per drop (cyan)
-        self.skill_boxes = []
-        for (x0, y0, x1, y1), _ in self.current_boxes:
+        paired_skills = [None] * len(drop_centers)
+        used = set()
+        for _, i, j in pairs:
+            if paired_skills[i] is None and j not in used:
+                paired_skills[i] = raw_skills[j]
+                used.add(j)
+
+        # --- Store for debug/UI ---
+        self.raw_skills    = raw_skills
+        self.paired_skills = paired_skills
+
+        # --- Build raw vs fallback coords + initial toggle state ---
+        self.skill_boxes_raw      = []
+        self.skill_boxes_fallback = []
+        self.use_raw_skill        = []
+        for i, ((x0, y0, x1, y1), _) in enumerate(self.current_boxes):
+            # fallback (cyan)
             ix1 = x0 - 2.5
             ix0 = ix1 - 25.5
-            yc = (y0 + y1 + 3) / 2
+            yc  = (y0 + y1 + 3) / 2
             iy0 = yc - 11.75
             iy1 = yc + 11.75
-            self.skill_boxes.append((ix0, iy0, ix1, iy1))
+            fallback = (ix0, iy0, ix1, iy1)
 
-        # Autofill drop count
+            # raw (magenta) if available
+            rec = paired_skills[i]
+            raw = rec['xyxy'] if rec else None
+
+            self.skill_boxes_fallback.append(fallback)
+            self.skill_boxes_raw.append(raw)
+            # default to raw if present, else fallback
+            self.use_raw_skill.append(bool(raw))
+
+        # --- Rebuild the active list that on‐click/zoom and drawing use ---
+        self.skill_boxes = []
+        for raw, fb, use in zip(self.skill_boxes_raw,
+                                self.skill_boxes_fallback,
+                                self.use_raw_skill):
+            self.skill_boxes.append(raw if use and raw else fb)
+
+        # --- Autofill drop count & compute CRNN preds ---
         cnt = len(self.current_boxes)
-        self.count_spin.delete(0, 'end')
-        self.count_spin.insert(0, str(cnt))
-        self.last_count = cnt
-        self._on_count_changed()
-
-        # Compute CRNN preds + confidences
+        self.count_spin.delete(0, 'end'); self.count_spin.insert(0, str(cnt))
+        self.last_count = cnt; self._on_count_changed()
         self._compute_crnn_preds()
 
-        # Auto-fill XP if confidences are high
-        if self.xp_confs and all(c >= 90.0 for c in self.xp_confs):
+        # --- Auto‐fill XP if confidences ≥80% ---
+        if self.xp_confs and all(c >= 80.0 for c in self.xp_confs):
             vals = ";".join(self.xp_preds)
-            self.value_entry.delete(0, 'end')
-            self.value_entry.insert(0, vals)
+            self.value_entry.delete(0, 'end'); self.value_entry.insert(0, vals)
             self.last_value = vals
 
-        # Draw & update
+        # --- Draw & load predictions UI ---
         self._draw_image()
         self.load_pred_frame()
 
-        # Focus entry
+        # --- Focus entry for next edit ---
         self.value_entry.focus_set()
         self.value_entry.selection_range(0, 'end')
 
@@ -309,172 +338,147 @@ class XPLabeler:
     def _draw_image(self):
         if not self.current_img:
             return
+
+        # 1) Canvas + image sizing
         cw, ch = self.canvas.winfo_width(), self.canvas.winfo_height()
         iw, ih = self.current_img.size
-        base = min(cw / iw, ch / ih)
-        sc = base * self.zoom
-        nw, nh = int(iw * sc), int(ih * sc)
+        base   = min(cw/iw, ch/ih)
+        sc     = base * self.zoom
+        nw, nh = int(iw*sc), int(ih*sc)
         if nw <= 0 or nh <= 0:
             return
 
-        # Prepare
-        img2 = self.current_img.resize((nw, nh), Image.LANCZOS).convert("RGBA")
-        overlay = Image.new('RGBA', img2.size, (0, 0, 0, 0))
-        draw = ImageDraw.Draw(overlay)
-        font = ImageFont.load_default()
-        bw = max(1, int(self.zoom))
+        # 2) Prepare layers
+        img2    = self.current_img.resize((nw, nh), Image.LANCZOS).convert("RGBA")
+        overlay = Image.new("RGBA", img2.size, (0, 0, 0, 0))
+        draw    = ImageDraw.Draw(overlay)
+        font    = ImageFont.load_default()
+        bw      = max(1, int(self.zoom))
 
         if self.show_boxes.get():
-            # 1) XP drop boxes (green/orange/red)
+            # 3a) Draw drop boxes (green/orange/red)
             for box, conf in self.current_boxes:
                 x0, y0, x1, y1 = [v * sc for v in box]
-                col = (
-                    (0, 255, 0, 255) if conf >= 80 else
-                    (255, 165, 0, 255) if conf >= 70 else
-                    (255, 0, 0, 255)
-                )
+                col = ((0,255,0,255) if conf>=80 else
+                       (255,165,0,255) if conf>=70 else
+                       (255,0,0,255))
                 draw.rectangle([x0, y0, x1, y1], outline=col, width=bw)
-                draw.text((x0, max(0, y0 - 12)), f"{conf:.0f}%", fill=col, font=font)
+                draw.text((x0, max(0, y0-12)), f"{conf:.0f}%", fill=col, font=font)
 
-            # 2) raw YOLO skill preds (magenta)
-            for x0, y0, x1, y1 in self.pred_skill_boxes:
-                sx0, sy0, sx1, sy1 = [v * sc for v in (x0, y0, x1, y1)]
-                draw.rectangle(
-                    [sx0, sy0, sx1, sy1],
-                    outline=(255, 0, 255, self.box_opacity),
-                    width=bw
-                )
+            # 3b) Draw **only** the per-row active skill/fallback box
+            for i, use_raw in enumerate(self.use_raw_skill):
+                # choose raw coords if toggled _and_ available, else fallback
+                bx = (self.skill_boxes_raw[i]
+                      if use_raw and self.skill_boxes_raw[i]
+                      else self.skill_boxes_fallback[i])
+                sx0, sy0, sx1, sy1 = [v * sc for v in bx]
 
-            # 3) hard-coded skill boxes (cyan)
-            for x0, y0, x1, y1 in self.skill_boxes:
-                sx0, sy0, sx1, sy1 = [v * sc for v in (x0, y0, x1, y1)]
-                draw.rectangle(
-                    [sx0, sy0, sx1, sy1],
-                    fill=(0, 255, 255, 0),
-                    outline=(0, 255, 255, self.box_opacity),
-                    width=bw
-                )
+                if use_raw and self.skill_boxes_raw[i]:
+                    # magenta
+                    draw.rectangle(
+                        [sx0, sy0, sx1, sy1],
+                        outline=(255, 0, 255, self.box_opacity),
+                        width=bw
+                    )
+                else:
+                    # cyan
+                    draw.rectangle(
+                        [sx0, sy0, sx1, sy1],
+                        fill=(0, 255, 255, 0),
+                        outline=(0, 255, 255, self.box_opacity),
+                        width=bw
+                    )
 
-        # Composite & show
-        comp = Image.alpha_composite(img2, overlay).convert("RGB")
+        # 4) Composite & display
+        comp       = Image.alpha_composite(img2, overlay).convert("RGB")
         self.tkimg = ImageTk.PhotoImage(comp)
-        self.canvas.delete('all')
+        self.canvas.delete("all")
         self.canvas.create_image(
-            self.origin_x + cw // 2,
-            self.origin_y + ch // 2,
+            self.origin_x + cw//2,
+            self.origin_y + ch//2,
             image=self.tkimg,
             anchor='center'
         )
 
     def load_pred_frame(self):
-        # clear out old widgets
+        # clear old widgets
         for w in self.pred_frame.winfo_children():
             w.destroy()
 
-        # 1) run YOLO once and collect ALL skill detections with their y‐centers
-        results = self.yolo_model.predict(self.current_img, verbose=False)[0]
-        classes = results.boxes.cls.cpu().numpy()
-        confs = results.boxes.conf.cpu().numpy()
-        xyxy = results.boxes.xyxy.cpu().numpy()
+        # DEBUG: raw detections
+        print("[DEBUG] Raw YOLO skill detections:")
+        for rec in self.raw_skills:
+            name = self.yolo_model.names[rec['cls']]
+            print(f"  {name} — conf={rec['conf']:.3f}, y={rec['y']:.1f}")
 
-        raw_skills = []
-        for cls, conf, (x0, y0, x1, y1) in zip(classes, confs, xyxy):
-            if int(cls) > 0:
-                yc = (y0 + y1) / 2.0
-                raw_skills.append({
-                    'cls': int(cls),
-                    'conf': float(conf),
-                    'y': yc
-                })
-
-        # 2) compute drop centers (already sorted top→bottom)
-        drop_centers = [((y0 + y1) / 2.0) for ((x0, y0, x1, y1), _) in self.current_boxes]
-        n_drops = len(drop_centers)
-        n_skills = len(raw_skills)
-
-        # 3) build all possible (drop_i, skill_j, vertical distance)
-        pairs = []
-        for i, dy in enumerate(drop_centers):
-            for j, sk in enumerate(raw_skills):
-                dist = abs(dy - sk['y'])
-                pairs.append((dist, i, j))
-        pairs.sort(key=lambda x: x[0])
-
-        # 4) greedy match: for each smallest-distance pair, assign if both unpaired
-        paired_skills = [None] * n_drops
-        used_skills = set()
-        for dist, i, j in pairs:
-            if paired_skills[i] is None and j not in used_skills:
-                paired_skills[i] = raw_skills[j]
-                used_skills.add(j)
-
-        # 5) DEBUG: print per-drop summary
+        # DEBUG: per-drop summary
         print("[DEBUG] ===== Per-Drop Summary =====")
-        for i, ((x0, y0, x1, y1), drop_conf) in enumerate(self.current_boxes, start=1):
-            xp = self.xp_preds[i - 1]
-            xp_c = self.xp_confs[i - 1]
-            rec = paired_skills[i - 1]
-
-            if rec is not None:
+        for i, ((x0,y0,x1,y1), drop_conf) in enumerate(self.current_boxes, start=1):
+            xp, xp_c = self.xp_preds[i-1], self.xp_confs[i-1]
+            rec      = self.paired_skills[i-1]
+            if rec:
                 sk_name = self.yolo_model.names[rec['cls']]
-                sk_pct = rec['conf'] * 100
-                sk_str = f"{sk_name} ({sk_pct:.0f}%)"
+                sk_pct  = rec['conf']*100
+                sk_str  = f"{sk_name} ({sk_pct:.0f}%)"
             else:
                 sk_str = "N/A"
-
             print(f"  Drop {i}: Xp={xp} ({xp_c:.0f}%) | "
                   f"DropConf={drop_conf:.1f}% | Skill={sk_str}")
         print("[DEBUG] =============================")
 
-        # 6) now render one GUI row per drop, with its paired skill
-        for i, ((x0, y0, x1, y1), drop_conf) in enumerate(self.current_boxes):
+        # render each row
+        for i, ((x0,y0,x1,y1), drop_conf) in enumerate(self.current_boxes):
             fr = tk.Frame(self.pred_frame)
             fr.pack(anchor='w', pady=2, fill='x')
 
-            # --- CRNN XP prediction ---
-            xp = self.xp_preds[i]
-            xp_c = self.xp_confs[i]
-            xp_col = 'lime' if xp_c >= 80 else \
-                'orange' if xp_c >= 70 else \
-                    'red'
-            tk.Label(fr,
-                     text=f"Xp value {i + 1}: {xp} ({xp_c:.0f}%)",
-                     fg=xp_col).pack(side='left', padx=(0, 10))
+            # XP
+            xp, xp_c = self.xp_preds[i], self.xp_confs[i]
+            xp_col   = 'lime' if xp_c>=80 else 'orange' if xp_c>=70 else 'red'
+            tk.Label(fr, text=f"Xp value {i+1}: {xp} ({xp_c:.0f}%)",
+                     fg=xp_col).pack(side='left', padx=(0,10))
 
-            # --- drop confidence ---
-            dc_col = 'lime' if drop_conf >= 80 else \
-                'orange' if drop_conf >= 70 else \
-                    'red'
-            tk.Label(fr,
-                     text=f"Drop {i + 1}: {drop_conf:.1f}%",
-                     fg=dc_col).pack(side='left', padx=(0, 10))
+            # Drop confidence
+            dc_col = 'lime' if drop_conf>=80 else 'orange' if drop_conf>=70 else 'red'
+            tk.Label(fr, text=f"Drop {i+1}: {drop_conf:.1f}%",
+                     fg=dc_col).pack(side='left', padx=(0,10))
 
-            # --- matched skill prediction ---
-            rec = paired_skills[i]
-            if rec is not None:
-                name = self.yolo_model.names[rec['cls']]
-                pct = rec['conf'] * 100
-                sk_col = 'lime' if pct >= 80 else \
-                    'orange' if pct >= 70 else \
-                        'red'
-                tk.Label(fr,
-                         text=f"Skill: {name} ({pct:.0f}%)",
-                         fg=sk_col,
-                         font=('Helvetica', 13, 'bold')
-                         ).pack(side='left', padx=(0, 10))
+            # Skill
+            rec   = self.paired_skills[i]
+            if rec:
+                name  = self.yolo_model.names[rec['cls']]
+                pct   = rec['conf'] * 100
+                sk_col = 'lime' if pct>=80 else 'orange' if pct>=70 else 'red'
+                tk.Label(fr, text=f"Skill: {name} ({pct:.0f}%)",
+                         fg=sk_col, font=('Helvetica',13,'bold')
+                        ).pack(side='left', padx=(0,10))
             else:
-                tk.Label(fr,
-                         text="Skill: N/A",
-                         fg='red',
-                         font=('Helvetica', 13, 'bold')
-                         ).pack(side='left', padx=(0, 10))
+                tk.Label(fr, text="Skill: N/A",
+                         fg='red', font=('Helvetica',13,'bold')
+                        ).pack(side='left', padx=(0,10))
 
-            # --- remove button ---
-            tk.Button(fr,
-                      text="Remove",
-                      fg='red',
+            # Remove button
+            tk.Button(fr, text="Remove", fg='red',
                       command=lambda idx=i: self.remove_box(idx)
-                      ).pack(side='left')
+                     ).pack(side='left', padx=(0,10))
+
+            # Use Predicted checkbox
+            var = tk.BooleanVar(value=self.use_raw_skill[i])
+            tk.Checkbutton(fr, text="Use Predicted", variable=var,
+                           command=lambda idx=i, v=var: self._toggle_skill(idx, v)
+                          ).pack(side='left')
+
+    def _toggle_skill(self, idx, var):
+        # flip between YOLO‐raw or fallback
+        self.use_raw_skill[idx] = var.get()
+
+        # rebuild for click/zoom
+        self.skill_boxes = []
+        for raw, fb, use in zip(self.skill_boxes_raw,
+                                self.skill_boxes_fallback,
+                                self.use_raw_skill):
+            self.skill_boxes.append(raw if use and raw else fb)
+
+        self._draw_image()
 
     def apply_random_order_logic(self):
         if self.random_order.get() and self.files:
@@ -483,20 +487,29 @@ class XPLabeler:
             self.current_index %= len(self.files)
 
     def on_click(self, event):
-        if not self.current_img: return
+        if not self.current_img:
+            return
+
         cw, ch = self.canvas.winfo_width(), self.canvas.winfo_height()
         iw, ih = self.current_img.size
         base = min(cw/iw, ch/ih)
-        ix = (event.x - (cw - iw*base)/2)/base
-        iy = (event.y - (ch - ih*base)/2)/base
-        for idx,(x0,y0,x1,y1) in enumerate(self.skill_boxes):
-            if x0<=ix<=x1 and y0<=iy<=y1:
+        # map canvas coords back to image coords
+        ix = (event.x - (cw - iw*base)/2) / base
+        iy = (event.y - (ch - ih*base)/2) / base
+
+        # check each active skill box
+        for idx, (x0, y0, x1, y1) in enumerate(self.skill_boxes):
+            if x0 <= ix <= x1 and y0 <= iy <= y1:
                 self.drag_idx = idx
-                self._zoom_to_box(x0,y0,x1,y1)
+                self._zoom_to_box(x0, y0, x1, y1)
                 self.canvas.focus_set()
                 return
+
+        # click outside any box resets zoom
         self.drag_idx = None
-        self.zoom = 1.0; self.origin_x = 0; self.origin_y = 0
+        self.zoom = 1.0
+        self.origin_x = 0
+        self.origin_y = 0
         self._draw_image()
 
     def move_skill_left(self, e):  self._move_selected_skill_box(-1,  0)
@@ -556,15 +569,33 @@ class XPLabeler:
         except ValueError:
             return
         self.last_count = cnt
+
+        # If no drops, clear XP input immediately
+        if cnt == 0:
+            self.value_entry.delete(0, 'end')
+            self.last_value = ""
+            # reset any stored defaults for zero if you like
+            self.defaults[0] = ("", [])
+            # also clear out any skill selectors
+            for w in getattr(self, 'skill_frame', []).winfo_children():
+                w.destroy()
+            self.last_nonzero_skills = []
+            return
+
+        # Otherwise, restore from defaults or current entry
         if cnt in self.defaults:
             xp_str, skills = self.defaults[cnt]
         else:
             xp_str = self.value_entry.get().strip()
             skills = [cb.get() for cb in getattr(self, 'skill_selectors', [])]
             skills = (skills + ['None']*cnt)[:cnt]
+
+        # fill in the XP entry
         self.value_entry.delete(0, 'end')
         self.value_entry.insert(0, xp_str)
         self.last_value = xp_str
+
+        # remember skills and rebuild selectors
         self.last_nonzero_skills = skills.copy()
         self.defaults[cnt] = (xp_str, skills.copy())
         self._render_skill_selectors(cnt)
@@ -617,17 +648,14 @@ class XPLabeler:
         if not self.files:
             return
 
-        fn = self.files[self.current_index]
+        fn  = self.files[self.current_index]
         val = self.value_entry.get().strip()
         cnt = self.last_count
 
-        # Build skills only if there are drops
-        if cnt > 0:
-            skills = [cb.get() for cb in self.skill_selectors]
-        else:
-            skills = []
+        # build skills list
+        skills = [cb.get() for cb in self.skill_selectors] if cnt > 0 else []
 
-        # Validation
+        # validations
         if cnt > 0 and not val:
             return self.status_label.config(text="Cannot save: XP missing", fg='red')
         if cnt > 0 and any(s == "None" for s in skills):
@@ -635,84 +663,97 @@ class XPLabeler:
         if val and cnt == 0:
             return self.status_label.config(text="Cannot save: XP without drops", fg='red')
 
-        # Record label
+        # record & move
         self.labels[fn] = (val, skills, cnt)
         self.defaults[cnt] = (val, skills.copy())
-
-        # Move file
         src = os.path.join(CROP_DIR, fn)
         dst = os.path.join(LABELED_DIR, fn)
         shutil.move(src, dst)
 
-        # Write YOLO .txt (only drop boxes when cnt==0)
         img = Image.open(dst)
         iw, ih = img.size
-        label_txt = os.path.splitext(fn)[0] + ".txt"
-        with open(os.path.join(LABELED_DIR, label_txt), 'w') as f:
-            # drop boxes
+        base, _ = os.path.splitext(fn)
+
+        # write .txt
+        with open(os.path.join(LABELED_DIR, base + ".txt"), 'w') as f:
+            # drops
             for box, _ in self.current_boxes:
                 x0, y0, x1, y1 = box
                 cx, cy = ((x0 + x1) / 2 / iw, (y0 + y1) / 2 / ih)
-                w, h = ((x1 - x0) / iw, (y1 - y0) / ih)
+                w, h   = ((x1 - x0) / iw, (y1 - y0) / ih)
                 f.write(f"0 {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}\n")
 
-            # skill boxes only if cnt > 0
-            if cnt > 0:
-                for idx, (sx0, sy0, sx1, sy1) in enumerate(self.skill_boxes):
-                    name = skills[idx]
-                    cid = SKILLS.index(name) if name in SKILLS else 0
-                    # shrink box by 1px
-                    sx0 += 1;
-                    sy0 += 1;
-                    sx1 -= 1;
-                    sy1 -= 1
-                    cx, cy = ((sx0 + sx1) / 2 / iw, (sy0 + sy1) / 2 / ih)
-                    w, h = ((sx1 - sx0) / iw, (sy1 - sy0) / ih)
-                    f.write(f"{cid} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}\n")
+            # skills (respects toggle & safe indexing)
+            for i in range(cnt):
+                # figure out which coords to use
+                raw_ok      = i < len(self.skill_boxes_raw) and self.skill_boxes_raw[i]
+                fallback_ok = i < len(self.skill_boxes_fallback) and self.skill_boxes_fallback[i]
+                use_raw     = self.use_raw_skill[i] if i < len(self.use_raw_skill) else False
 
-        # Write JSON metadata
+                if use_raw and raw_ok:
+                    bx = self.skill_boxes_raw[i]
+                elif fallback_ok:
+                    bx = self.skill_boxes_fallback[i]
+                else:
+                    # no box to write; skip
+                    continue
+
+                sx0, sy0, sx1, sy1 = bx
+                name = skills[i] if i < len(skills) else "None"
+                cid  = SKILLS.index(name) if name in SKILLS else 0
+                cx, cy = ((sx0 + sx1) / 2 / iw, (sy0 + sy1) / 2 / ih)
+                w, h   = ((sx1 - sx0) / iw, (sy1 - sy0) / ih)
+                f.write(f"{cid} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}\n")
+
+        # write .json
         data = {
-            "filename": fn,
+            "filename":   fn,
             "drop_count": cnt,
-            "xp_values": val.split(";") if val else [],
-            "skills": skills,
-            "boxes": []
+            "xp_values":  val.split(";") if val else [],
+            "skills":     skills,
+            "boxes":      []
         }
-        # drop entries
+        # drops
         for box, _ in self.current_boxes:
             x0, y0, x1, y1 = box
             data["boxes"].append({
-                "class": 0,
+                "class":    0,
                 "center_x": float((x0 + x1) / 2 / iw),
                 "center_y": float((y0 + y1) / 2 / ih),
-                "width": float((x1 - x0) / iw),
-                "height": float((y1 - y0) / ih)
+                "width":    float((x1 - x0) / iw),
+                "height":   float((y1 - y0) / ih)
             })
-        # skill entries only if cnt > 0
-        if cnt > 0:
-            for idx, (sx0, sy0, sx1, sy1) in enumerate(self.skill_boxes):
-                name = skills[idx]
-                cid = SKILLS.index(name) if name in SKILLS else 0
-                sx0 += 1;
-                sy0 += 1;
-                sx1 -= 1;
-                sy1 -= 1
-                data["boxes"].append({
-                    "class": cid,
-                    "center_x": float((sx0 + sx1) / 2 / iw),
-                    "center_y": float((sy0 + sy1) / 2 / ih),
-                    "width": float((sx1 - sx0) / iw),
-                    "height": float((sy1 - sy0) / ih)
-                })
+        # skills
+        for i in range(cnt):
+            raw_ok      = i < len(self.skill_boxes_raw) and self.skill_boxes_raw[i]
+            fallback_ok = i < len(self.skill_boxes_fallback) and self.skill_boxes_fallback[i]
+            use_raw     = self.use_raw_skill[i] if i < len(self.use_raw_skill) else False
 
-        with open(os.path.join(LABELED_DIR, os.path.splitext(fn)[0] + ".json"), 'w') as f:
+            if use_raw and raw_ok:
+                bx = self.skill_boxes_raw[i]
+            elif fallback_ok:
+                bx = self.skill_boxes_fallback[i]
+            else:
+                continue
+
+            sx0, sy0, sx1, sy1 = bx
+            name = skills[i] if i < len(skills) else "None"
+            cid  = SKILLS.index(name) if name in SKILLS else 0
+            data["boxes"].append({
+                "class":    cid,
+                "center_x": float((sx0 + sx1) / 2 / iw),
+                "center_y": float((sy0 + sy1) / 2 / ih),
+                "width":    float((sx1 - sx0) / iw),
+                "height":   float((sy1 - sy0) / ih)
+            })
+
+        with open(os.path.join(LABELED_DIR, base + ".json"), 'w') as f:
             json.dump(data, f, indent=2)
 
-        # Finalize
+        # finalize
         self.files.pop(self.current_index)
         self.action_history.append({'type': 'save', 'filename': fn, 'idx': self.current_index})
         self.status_label.config(text=f"Saved {fn}", fg='green')
-
         if self.files:
             self.apply_random_order_logic()
         else:
@@ -720,28 +761,41 @@ class XPLabeler:
         self.load_image()
 
     def remove_box(self, idx):
-        if 0 <= idx < len(self.current_boxes):
-            # remove the visual boxes
-            del self.current_boxes[idx]
-            del self.skill_boxes[idx]
+        # only if valid
+        if not (0 <= idx < len(self.current_boxes)):
+            return
 
-            # **new**: remove the matching CRNN prediction and confidence
-            del self.xp_preds[idx]
-            del self.xp_confs[idx]
+        # 1) remove the drop box + confidences
+        del self.current_boxes[idx]
+        del self.xp_preds[idx]
+        del self.xp_confs[idx]
 
-            # redraw & re-populate
-            self._draw_image()
-            self.load_pred_frame()
+        # 2) remove the paired‐skill entries
+        del self.paired_skills[idx]
+        del self.skill_boxes_raw[idx]
+        del self.skill_boxes_fallback[idx]
+        del self.use_raw_skill[idx]
 
-            # restore focus & selection
-            self.value_entry.focus_set()
-            self.value_entry.selection_range(0, 'end')
+        # 3) rebuild the active skill_boxes list for drawing & click
+        self.skill_boxes = []
+        for raw, fb, use in zip(self.skill_boxes_raw,
+                                self.skill_boxes_fallback,
+                                self.use_raw_skill):
+            self.skill_boxes.append(raw if use and raw else fb)
 
-            # update the drop count spinbox to match
-            new_count = len(self.current_boxes)
-            self.count_spin.delete(0, 'end')
-            self.count_spin.insert(0, str(new_count))
-            self._on_count_changed()
+        # 4) update the drop‐count spinbox and defaults
+        new_count = len(self.current_boxes)
+        self.count_spin.delete(0, 'end')
+        self.count_spin.insert(0, str(new_count))
+        self._on_count_changed()
+
+        # 5) redraw image and repopulate the prediction frame
+        self._draw_image()
+        self.load_pred_frame()
+
+        # 6) restore focus & selection on the XP entry
+        self.value_entry.focus_set()
+        self.value_entry.selection_range(0, 'end')
 
     def undo_label(self):
         if not self.action_history:
