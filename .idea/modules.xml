@@ -2,7 +2,7 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
-      <module fileurl="file://$PROJECT_DIR$/.idea/osrs_learner.iml" filepath="$PROJECT_DIR$/.idea/osrs_learner.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/xp_labeler.iml" filepath="$PROJECT_DIR$/.idea/xp_labeler.iml" />
     </modules>
   </component>
 </project>
