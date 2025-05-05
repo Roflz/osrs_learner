@@ -5,7 +5,7 @@ from gui.data_tab import DataTab
 from gui.verification_tab import VerificationTab
 from themes.dark_theme import apply_dark_theme
 from gui.labeling_tab import LabelingTab
-from gui.training_tab import TrainingTab
+from gui.training_tab.training_tab import TrainingTab
 
 def main():
     root = tk.Tk()
