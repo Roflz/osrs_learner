@@ -20,8 +20,6 @@ SKILL_THRESHOLD = 80.0
 DATA_YAML = 'data.yaml'
 with open(DATA_YAML, 'r') as yf:
     cfg = yaml.safe_load(yf)
-# cfg['names'] is a dict of class-id→name
-# We want SKILLS list aligned to class IDs
 SKILLS = [cfg['names'][i] for i in sorted(cfg['names'].keys())]
 
 # UI Theme colors

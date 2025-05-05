@@ -13,45 +13,48 @@ import time
 from collections import Counter
 from itertools import zip_longest
 from PIL import Image, ImageEnhance
+import json
+import sys
+# allow importing project-local config module
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from config import SKILLS
 
 # ─── DEFAULT CONFIG ─────────────────────────────────────────────────────────
-DEFAULT_SKILL_ICON_DIR = "data/skill_icons_clean"   # input PNGs
-DEFAULT_BG_IMG_DIR     = "data/backgrounds"         # backgrounds
-DEFAULT_OUT_IMG_DIR    = "data/yolo/synth_skill/images"
-DEFAULT_OUT_ANN_DIR    = "data/yolo/synth_skill/labels"
-REAL_LABEL_DIRS        = [
-    "data/yolo/real/train/labels",
-    "data/yolo/real/val/labels",
-]
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+DEFAULT_SKILL_ICON_DIR = os.path.join(BASE_DIR, "data/skill_icons_clean")
+DEFAULT_BG_IMG_DIR     = os.path.join(BASE_DIR, "data/backgrounds")
+DEFAULT_OUT_IMG_DIR    = os.path.join(BASE_DIR, "data/yolo/synth_skill/images")
+DEFAULT_OUT_ANN_DIR    = os.path.join(BASE_DIR, "data/yolo/synth_skill/labels")
+REAL_JSON_DIR          = os.path.join(BASE_DIR, "data/xp_crops_labeled")
 DEFAULT_NUM_IMAGES     = 8000
 DEFAULT_MAX_ICONS      = 5
 DEFAULT_SEED           = 42
 # ─── END CONFIG ─────────────────────────────────────────────────────────────
 
-def load_real_counts(label_dirs, skip_classes=None):
+def load_real_counts_from_json(json_dir, skip_classes=None):
     counts = Counter()
     skip = set(skip_classes or [])
-    for ld in label_dirs:
-        for fn in os.listdir(ld):
-            if not fn.endswith(".txt"):
+    if not os.path.isdir(json_dir):
+        return counts
+    for fn in os.listdir(json_dir):
+        if not fn.lower().endswith('.json'):
+            continue
+        path = os.path.join(json_dir, fn)
+        try:
+            data = json.load(open(path))
+        except Exception:
+            continue
+        for skill_name in data.get('skills', []):
+            cid = SKILLS.index(skill_name) if skill_name in SKILLS else None
+            if cid is None or cid in skip:
                 continue
-            with open(os.path.join(ld, fn)) as f:
-                for line in f:
-                    parts = line.split()
-                    if not parts:
-                        continue
-                    cid = int(parts[0])
-                    if cid in skip:
-                        continue
-                    counts[cid] += 1
+            counts[cid] += 1
     return counts
 
+# retain original utility for printing tables
 def get_table_lines(headers, rows):
-    # Build formatted table lines
-    col_widths = [
-        max(len(str(headers[i])), *(len(str(r[i])) for r in rows)) + 2
-        for i in range(len(headers))
-    ]
+    col_widths = [max(len(str(headers[i])), *(len(str(r[i])) for r in rows)) + 2
+                  for i in range(len(headers))]
     header = " | ".join(str(headers[i]).center(col_widths[i]) for i in range(len(headers)))
     sep = "-" * len(header)
     lines = [sep, header, sep]
@@ -60,6 +63,7 @@ def get_table_lines(headers, rows):
         lines.append(line)
     lines.append(sep)
     return lines
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -77,31 +81,29 @@ def main():
     use_weights = not args.no_weights
     max_weight  = args.max_weight
 
-    # ── Clear previous outputs ─────────────────────────────────────────────
+    # Clear previous outputs
     if os.path.isdir(DEFAULT_OUT_IMG_DIR):
         shutil.rmtree(DEFAULT_OUT_IMG_DIR)
     if os.path.isdir(DEFAULT_OUT_ANN_DIR):
         shutil.rmtree(DEFAULT_OUT_ANN_DIR)
 
     print("=== Synth Skills ===")
-    print(f"Using real-data labels: {REAL_LABEL_DIRS}")
+    print(f"Using real-data JSON: {REAL_JSON_DIR}")
     print(f"Generating {args.num_images} images; max_icons={args.max_icons}")
     print(f"{'Inverse-frequency' if use_weights else 'Uniform'} sampling of skills")
     print(f"Outputs -> images: {DEFAULT_OUT_IMG_DIR}, labels: {DEFAULT_OUT_ANN_DIR}\n")
 
     random.seed(args.seed)
 
-    # 1) Load real-data counts
-    real_counts = load_real_counts(REAL_LABEL_DIRS, skip_classes=[0])
+    # 1) Load real-data counts directly from JSON
+    real_counts = load_real_counts_from_json(REAL_JSON_DIR, skip_classes=[0])
     max_count   = max(real_counts.values()) if real_counts else 1
 
     # 2) Load skill names and icons
     skill_files = [f for f in os.listdir(DEFAULT_SKILL_ICON_DIR) if f.lower().endswith(".png")]
     skills      = sorted(os.path.splitext(f)[0] for f in skill_files)
-    skill_icons = {
-        name: Image.open(os.path.join(DEFAULT_SKILL_ICON_DIR, name + ".png")).convert("RGBA")
-        for name in skills
-    }
+    skill_icons = {name: Image.open(os.path.join(DEFAULT_SKILL_ICON_DIR, name + ".png")).convert("RGBA")
+                   for name in skills}
 
     # 3) Compute sampling weights
     if use_weights:
@@ -116,7 +118,7 @@ def main():
     else:
         skill_weights = [1.0] * len(skills)
 
-    # Summary tables side by side
+    # Summary tables
     headers1 = ["Skill", "Count", "Weight"]
     rows1 = []
     for idx, name in enumerate(skills):
@@ -136,11 +138,9 @@ def main():
     print()
 
     # 4) Gather backgrounds
-    bg_files = [
-        os.path.join(DEFAULT_BG_IMG_DIR, f)
-        for f in os.listdir(DEFAULT_BG_IMG_DIR)
-        if f.lower().endswith((".png", ".jpg", ".jpeg"))
-    ]
+    bg_files = [os.path.join(DEFAULT_BG_IMG_DIR, f)
+                for f in os.listdir(DEFAULT_BG_IMG_DIR)
+                if f.lower().endswith((".png", ".jpg", ".jpeg"))]
     if not bg_files:
         raise RuntimeError(f"No backgrounds found in {DEFAULT_BG_IMG_DIR}")
 
@@ -182,7 +182,6 @@ def main():
             if ann_lines:
                 f.write("\n".join(ann_lines))
 
-        # emit CLI progress marker
         print(f"PROGRESS {i+1}/{args.num_images}", flush=True)
 
     elapsed = time.time() - start

@@ -2,6 +2,9 @@
 import tkinter as tk
 from tkinter import ttk
 
+from gui.training_tab.stats_utils import update_stats
+
+
 # === Top-level UI Layout Entrypoint ===
 def build_training_ui(self):
     """
@@ -290,7 +293,7 @@ def _populate_stats_panel(self):
     self.stats_text.configure(yscrollcommand=stats_scroll.set)
     self.stats_text.grid(row=0, column=0, sticky='nsew', padx=5, pady=5)
     stats_scroll.grid(row=0, column=1, sticky='ns', padx=(0,5), pady=5)
-    refresh_btn = ttk.Button(self.stats_frame, text='Refresh', command=self._update_stats)
+    refresh_btn = ttk.Button(self.stats_frame, text='Refresh', command=lambda: update_stats(self))
     refresh_btn.grid(row=1, column=0, columnspan=2, sticky='e', padx=5, pady=(0,5))
 
 # === Populate Log Panel ===

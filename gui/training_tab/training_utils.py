@@ -63,15 +63,42 @@ def clear_real_data():
     paths = [
         'data/yolo/real/train/images',
         'data/yolo/real/train/json',
+        'data/yolo/real/train/labels',
         'data/yolo/real/val/images',
-        'data/yolo/real/val/json'
+        'data/yolo/real/val/json',
+        'data/yolo/real/val/labels'
     ]
     clear_dirs(paths, recreate=True)
 
+import os
+import shutil
+
 def clear_synth_numbers():
-    paths = ['data/yolo/synth_numbers/images', 'data/yolo/synth_numbers/labels']
+    # all the dirs you already clear
+    paths = [
+        'data/yolo/synth_numbers/images',
+        'data/yolo/synth_numbers/train/images',
+        'data/yolo/synth_numbers/train/labels',
+        'data/yolo/synth_numbers/labels',
+        'data/yolo/synth_numbers/val/images',
+        'data/yolo/synth_numbers/val/labels',
+    ]
+    # remove & recreate each
     clear_dirs(paths, recreate=True)
 
+    # now also delete the mapping CSV if it exists
+    csv_path = os.path.join('data', 'yolo', 'synth_numbers', 'synth_map.csv')
+    if os.path.isfile(csv_path):
+        os.remove(csv_path)
+
+
 def clear_synth_skills():
-    paths = ['data/yolo/synth_skills/images', 'data/yolo/synth_skills/labels']
+    paths = [
+        'data/yolo/synth_skill/images',
+        'data/yolo/synth_skill/train/images',
+        'data/yolo/synth_skill/train/labels',
+        'data/yolo/synth_skill/labels',
+        'data/yolo/synth_skill/val/images',
+        'data/yolo/synth_skill/val/labels'
+    ]
     clear_dirs(paths, recreate=True)
