@@ -1,5 +1,7 @@
 import os
 
+import yaml
+
 # Base data directories
 CROP_DIR = os.path.join('data', 'xp_crops')
 LABELED_DIR = os.path.join('data', 'xp_crops_labeled')
@@ -14,15 +16,13 @@ DROP_THRESHOLD = 80.0
 XP_THRESHOLD = 80.0
 SKILL_THRESHOLD = 80.0
 
-# Skills classes
-SKILLS = [
-    "drop", "agility", "attack", "construction",
-    "cooking", "crafting", "defence", "farming",
-    "firemaking", "fishing", "fletching", "herblore",
-    "hitpoints", "hunter", "magic", "mining",
-    "prayer", "ranged", "runecrafting", "smithing",
-    "slayer", "strength", "thieving", "woodcutting"
-]
+# Skills classes: load dynamically from data.yaml, including class 0
+DATA_YAML = 'data.yaml'
+with open(DATA_YAML, 'r') as yf:
+    cfg = yaml.safe_load(yf)
+# cfg['names'] is a dict of class-id→name
+# We want SKILLS list aligned to class IDs
+SKILLS = [cfg['names'][i] for i in sorted(cfg['names'].keys())]
 
 # UI Theme colors
 BG_COLOR = '#1e1e1e'

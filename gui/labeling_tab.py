@@ -209,9 +209,6 @@ class LabelingTab:
 
         # 1) YOLO → pass the PIL.Image directly
         detections = self.yolo.predict(img)
-        print(f"[DEBUG] YOLO returned {len(detections)} detections:")
-        for d in detections:
-            print("   ", d)
 
         # 2) SPLIT — no thresholds yet, just collect everything
         self.current_boxes.clear()
@@ -236,9 +233,6 @@ class LabelingTab:
                     'y':    yc,
                     'xyxy': (x0, y0, x1, y1)
                 })
-
-        print(f"[DEBUG] Built current_boxes: {self.current_boxes}")
-        print(f"[DEBUG] Built raw_skills:   {raw_skills}")
 
         # 3) Pair drops ↔ skills (same as before)
         self.current_boxes.sort(key=lambda t: t[0][1])
@@ -400,15 +394,6 @@ class LabelingTab:
         # clear old
         for w in self.pred_frame.winfo_children():
             w.destroy()
-
-        # debug log
-        print("[DEBUG] ===== Per-Drop Summary =====")
-        for i, ((x0,y0,x1,y1), drop_conf) in enumerate(self.current_boxes, start=1):
-            xp, xp_c = self.xp_preds[i-1], self.xp_confs[i-1]
-            rec = self.paired_skills[i-1]
-            sk_name = rec['name'] if rec else "N/A"
-            sk_pct  = (rec['conf']*100) if rec else 0
-            print(f"  Drop {i}: Xp={xp} ({xp_c:.0f}%) | DropConf={drop_conf:.1f}% | Skill={sk_name} ({sk_pct:.0f}%)")
 
         # render rows
         for i, ((x0,y0,x1,y1), drop_conf) in enumerate(self.current_boxes):
@@ -606,15 +591,11 @@ class LabelingTab:
         """
         Undo the last save or skip action. Moves file back into CROP_DIR and reloads it.
         """
-        # Debug: what’s in the action history?
-        print("[DEBUG] action_history:", self.action_history)
-
         if not getattr(self, 'action_history', None):
             self.status_label.config(text="Nothing to undo.", fg='gray')
             return
 
         act = self.action_history.pop()
-        print("[DEBUG] Popped action:", act)
 
         fn = act.get('filename')
         idx = act.get('idx', self.current_index)
@@ -630,18 +611,15 @@ class LabelingTab:
             self.status_label.config(text=f"Unknown action '{action_type}'", fg='red')
             return
 
-        print(f"[DEBUG] Moving {src} -> {dst}")
         try:
             shutil.move(src, dst)
         except Exception as e:
-            print(f"[DEBUG] Move failed:", e)
             self.status_label.config(text=f"Undo failed: {e}", fg='red')
             return
 
         # Reinsert filename at original index
         self.files.insert(idx, fn)
         self.current_index = idx
-        print("[DEBUG] New files list:", self.files)
 
         # Refresh UI
         self.status_label.config(text=f"Undid {action_type} of {fn}", fg='blue')

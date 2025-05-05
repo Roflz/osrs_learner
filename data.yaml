@@ -1,0 +1,36 @@
+path: D:/PycharmProjects/xp_labeler/data
+train:
+  - yolo/real/train/images
+  - yolo/synth_numbers/train/images
+  - yolo/synth_skill/train/images
+val:
+  - yolo/real/val/images
+  - yolo/synth_numbers/val/images
+  - yolo/synth_skill/val/images
+
+nc: 24
+names:
+  0: drop
+  1: agility
+  2: attack
+  3: construction
+  4: cooking
+  5: crafting
+  6: defence
+  7: farming
+  8: firemaking
+  9: fishing
+  10: fletching
+  11: herblore
+  12: hitpoints
+  13: hunter
+  14: magic
+  15: mining
+  16: prayer
+  17: ranged
+  18: runecrafting
+  19: slayer
+  20: smithing
+  21: strength
+  22: thieving
+  23: woodcutting
