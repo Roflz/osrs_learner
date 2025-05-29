@@ -35,14 +35,26 @@ def build_split_synth_cmd(pct, mode):
     return [sys.executable, script, '--pct', str(pct)]
 
 def build_yolo_cmd(cfg):
-    cmd = [sys.executable, 'training/train_yolo.py',
-           '--model', cfg['model_path'],
-           '--data', cfg['data_yaml'],
-           '--epochs', str(cfg['epochs']),
-           '--imgsz', str(cfg['imgsz']),
-           '--batch', str(cfg['batch'])]
-    if cfg.get('rect'): cmd.append('--rect')
+    """
+    Returns a cmd list that runs exactly:
+      cmd.exe /c yolo detect train model=… data=… epochs=… imgsz=… batch=… rect=True verbose=False
+    """
+    cmd = [
+        "cmd.exe", "/c",
+        "yolo", "detect", "train",
+        f"model={cfg['model_path']}",
+        f"data={cfg['data_yaml']}",
+        f"epochs={cfg['epochs']}",
+        f"imgsz={cfg['imgsz']}",
+        f"batch={cfg['batch']}"
+    ]
+    if cfg.get("rect"):
+        cmd.append("rect=True")
+    # replace --quiet with the proper verbose=False flag
+    cmd.append("verbose=False")
     return cmd
+
+
 
 def build_crnn_cmd(cfg):
     return [sys.executable, 'training/train_crnn.py',

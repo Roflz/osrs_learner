@@ -3,6 +3,7 @@ from tkinter import ttk
 from config import SKILLS
 from .training_ui import build_training_ui
 from .stats_utils import update_stats
+from gui.training_tab.stats_utils import _compute_synth_balance
 
 
 class TrainingTab(ttk.Frame):
@@ -285,6 +286,19 @@ class TrainingTab(ttk.Frame):
             # all done (or aborted), reset Run All / Stop buttons
             self.btn_stop.config(state='disabled')
             self.btn_run_all.config(state='normal')
+
+    def _on_match_real(self):
+        """
+        Mirror match-real behavior in the TrainingTab context.
+        """
+        real_cnt, synth_cnt, need_cnt = _compute_synth_balance()
+        if getattr(self, 'match_real_var', False) and self.match_real_var.get():
+            # fill and lock the synth count
+            self.syn_num.set(str(need_cnt))
+            self.syn_num_entry.config(state='disabled')
+        else:
+            # re-enable manual editing
+            self.syn_num_entry.config(state='normal')
 
     # Mouse-wheel scroll handler
     def _on_mousewheel(self, event):
